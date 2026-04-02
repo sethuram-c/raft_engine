@@ -4,24 +4,42 @@ CPPFLAGS = -Iinclude
 LDFLAGS =
 LDLIBS =
 
-TARGET = build/raft-engine
-SOURCES = src/main.c
+APP = build/raft-engine
+TEST_LOG = build/test_raft_log
+TEST_NODE = build/test_raft_node
+LIB_SOURCES = src/raft_log.c src/raft_node.c
+PUBLIC_HEADERS = include/raft_types.h include/raft_log.h include/raft_node.h
 
-.PHONY: all run test clean
+.PHONY: all run demo test test-smoke test-unit clean
 
-all: $(TARGET)
+all: $(APP)
 
-$(TARGET): $(SOURCES) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+$(APP): src/main.c $(LIB_SOURCES) $(PUBLIC_HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(TEST_LOG): tests/test_raft_log.c src/raft_log.c $(PUBLIC_HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_log.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
+
+$(TEST_NODE): tests/test_raft_node.c $(LIB_SOURCES) $(PUBLIC_HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_node.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
 build:
 	mkdir -p build
 
-run: $(TARGET)
-	./$(TARGET)
+run: $(APP)
+	./$(APP)
 
-test: $(TARGET)
-	sh tests/test_smoke.sh ./$(TARGET)
+demo: $(APP)
+	./$(APP) --demo
+
+test: test-smoke test-unit
+
+test-smoke: $(APP)
+	sh tests/test_smoke.sh ./$(APP)
+
+test-unit: $(TEST_LOG) $(TEST_NODE)
+	./$(TEST_LOG)
+	./$(TEST_NODE)
 
 clean:
 	rm -rf build
