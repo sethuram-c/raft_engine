@@ -1,53 +1,51 @@
 # Development progress
 
-## Phase 2 / 35 — Core Raft types, log, and node model
+## Phase 1 / 35 — Fedora setup + GNU Make
 
-**Budget:** approximately 2 hours (theoretical study can take longer).
+**Implemented:** project skeleton, executable, Git-ready layout, smoke tests.
+
+## Phase 2 / 35 — Core Raft types and in-memory log
+
+**Implemented:** Raft IDs and roles, node lifecycle, binary-safe dynamic log,
+local invariants, smoke tests and 9 unit tests.
+
+## Phase 3 / 35 — Static three-node configuration
+
+**Target time:** ~2 hours  
+**Planned milestone date:** January 3, 2027 (record genuine commit times)
 
 ### Deliverable
 
-A compilable, testable, in-memory Raft domain model with deep-copy command
-storage, log indexing and truncation, and a node invariant checker. No
-networking or consensus behavior is claimed.
+A CLI that reads a human-editable three-node static cluster file,
+validates all peers, and prints a deterministic cluster summary.
 
 ### Acceptance criteria
 
-- [ ] `make clean && make` builds warning-free using GCC and C11.
-- [ ] `make demo` shows a follower and two sample log entries.
-- [ ] `make test` passes 4 smoke checks and 9 C unit-test functions.
-- [ ] Append operations preserve binary command bytes after caller mutation.
-- [ ] Invalid indices and nonmonotonic appended terms are rejected.
-- [ ] Truncation frees discarded command buffers and supports re-append.
-- [ ] Invalid node commit/applied bounds fail invariant checks.
-- [ ] Phase 2 changes committed and pushed after review.
+- [x] C11 implementation and public config API
+- [x] Three example loopback configuration files
+- [x] Local ID exists in the exactly-three-peer list
+- [x] Duplicate peer IDs and duplicate IPv4:port addresses rejected
+- [x] Malformed, overflowing, zero and out-of-range numbers rejected
+- [x] Unknown keys, too-long lines and extra peers rejected
+- [x] Output destination unchanged if parsing/validation fails
+- [x] `make test` passes including earlier log/node tests
+- [x] `make check-config` succeeds for all three nodes
+- [ ] Run on your own Fedora machine
+- [ ] Review and commit the change to your own Git repository
 
-### Commands
+### Verify
 
 ```sh
-make clean && make
-make demo
-make test
-valgrind --leak-check=full --error-exitcode=1 ./build/test_raft_log
-valgrind --leak-check=full --error-exitcode=1 ./build/test_raft_node
+make clean && make && make test
+make check-config
+./build/raft-engine --check-config config/node2.conf
 ```
 
-### Main files changed
-
-- Makefile, README.md, progress.md, docs/architecture.md
-- src/main.c, src/raft_log.c, src/raft_node.c
-- include/raft_types.h, include/raft_log.h, include/raft_node.h
-- tests/test_smoke.sh, tests/test_raft_log.c, tests/test_raft_node.c
-
-### Commit subject
+### Commit suggestion
 
 ```text
-feat: implement in-memory raft node and log data structures
+feat: validate fixed three-node raft cluster configuration
 ```
 
-The day-two planning slot is January 2, 2027, after 20:30 IST. The date should
-only be recorded in Git if it reflects when the work was actually completed.
-
-## Phase 1 / 35 — Project bootstrap
-
-Established the Fedora C11 + GNU Make project, Git workflow, a command-line
-executable, and automated smoke testing.
+**Scope limit:** this milestone does not start three processes, open TCP
+listeners, establish consensus, or persist Raft state. Networking is next.

@@ -1,103 +1,112 @@
 # Raft Engine
 
-An educational, fixed-membership distributed key-value store written in **C11**.
-This project is built incrementally around the Raft consensus algorithm using
-**GNU Make** on **Fedora Linux**.
+A learning-oriented distributed key-value store being implemented in **C11** on
+**Fedora Linux** with **GNU Make** and a fixed three-node Raft cluster.
 
-**Current status: Phase 2 / 35.** Core Raft node and log **data structures** are
-implemented and tested. Networking, leader election, actual replication,
-persistence, and quorum-based commitment are **not yet implemented**.
+**Current milestone: Phase 3 of 35.** The in-memory Raft node/log model and the
+static cluster configuration parser exist. **There is no network server, leader
+election, distributed consensus, or working key-value store yet.**
 
-## Implemented in Phase 2
+## What works today
 
-- Typed node IDs, terms, log indices, roles, and return codes.
-- In-memory Raft log with 1-based indices and an index-0 virtual prefix.
-- Deep-copied binary command buffers; geometric dynamic-array growth.
-- Log term lookup and suffix truncation, including edge-case validation.
-- Raft node initialization, destruction, and structural invariant checks.
-- Two C unit-test executables plus CLI smoke tests.
-- A `--demo` command displaying a synthetic node with sample log entries.
+- In-memory Raft node state and dynamically owned binary-safe log entries.
+- Log append, term lookup, suffix truncation, and local structural checks.
+- Static three-node configuration parsing and validation.
+- IPv4 addresses, strict TCP port checks, unique peer IDs and endpoints.
+- Informative errors for malformed configuration files.
+- CLI verification of three example configs without opening a socket.
+- Smoke tests, unit tests, and an isolated CLI integration test.
 
-## Planned features
-
-- Three-node leader election, heartbeats, and TCP RPCs.
-- Conflict resolution, replicated logs, and majority-based commits.
-- Deterministic key-value state machine and client interface.
-- Persistent term/vote/log storage and crash recovery.
-- Failure-injection and integration testing.
-
-## Requirements
-
-Fedora Linux, GCC, GNU Make; GDB and Valgrind are recommended:
+## Fedora requirements
 
 ```sh
 sudo dnf install -y gcc make git gdb valgrind
 ```
 
-## Build and verify
+## Build and test
 
 ```sh
 make clean
-make              # Builds build/raft-engine
-make run          # Prints startup message
-make demo         # Shows sample in-memory Raft node and log
-make test         # Runs CLI smoke checks AND C unit tests
-make test-unit    # Runs the log and node unit tests only
-make test-smoke   # Runs CLI tests only
-make clean        # Deletes generated build/ files
+make
+make test
+make check-config
+make demo
 ```
 
-`make test` should end with:
-
-```text
-PASS: 5 Raft log unit tests
-PASS: 4 Raft node unit tests
-```
-
-The smoke script additionally checks version, startup, demonstration output, and
-invalid CLI arguments. The version is `raft-engine 0.2.0`.
-
-### Optional memory checks
+## Inspect cluster configuration
 
 ```sh
-make test
-valgrind --leak-check=full --error-exitcode=1 ./build/test_raft_log
-valgrind --leak-check=full --error-exitcode=1 ./build/test_raft_node
+./build/raft-engine --check-config config/node1.conf
+./build/raft-engine --check-config config/node2.conf
+./build/raft-engine --check-config config/node3.conf
 ```
 
-## Repository structure
+Example output for node 2:
+
+```text
+Config valid: node_id=2 peers=3
+peer 1 127.0.0.1:7001
+peer 2 127.0.0.1:7002 (self)
+peer 3 127.0.0.1:7003
+Config only: no sockets opened or nodes started.
+```
+
+## Configuration grammar (Phase 3)
+
+```ini
+# A full-line comment
+node_id=1
+peer=1,127.0.0.1,7001
+peer=2,127.0.0.1,7002
+peer=3,127.0.0.1,7003
+```
+
+- Exactly one `node_id` key and exactly **three** `peer` records are required.
+- Node IDs are unique nonzero 32-bit unsigned integers, including the local ID.
+- Each peer has `id,IPv4,port` where the decimal port is between 1 and 65535.
+- No two peers may reuse the same IPv4 + port endpoint.
+- Blank lines, leading/trailing spaces, CRLF, and full-line `#` comments work.
+- Inline comments, hostnames, IPv6, environment interpolation, and dynamic
+  membership are **not** part of the current format.
+- Peers are sorted by ascending node ID after successful validation.
+- The local node must appear exactly once; the reader never starts sockets.
+
+All example nodes use `127.0.0.1`, so they are intended for **three processes
+on one Linux machine** when TCP support is implemented in later phases.
+
+## Project tree
 
 ```text
 raft-engine/
-├── Makefile
-├── include/
-│   ├── raft_types.h      # Primitive IDs, roles, status codes
-│   ├── raft_log.h        # In-memory log API and ownership contract
-│   └── raft_node.h       # In-memory node data model
-├── src/
-│   ├── main.c            # CLI and synthetic demonstration
-│   ├── raft_log.c        # Grow, copy, lookup, truncate, free
-│   └── raft_node.c       # Node initialization and local invariants
-├── tests/
-│   ├── test_smoke.sh     # CLI smoke checks
-│   ├── test_raft_log.c   # Log unit tests
-│   └── test_raft_node.c  # Node unit tests
-├── docs/architecture.md
-├── progress.md
-├── .gitignore
-└── README.md
+  Makefile
+  config/node{1,2,3}.conf
+  include/{raft_types,raft_log,raft_node,raft_config}.h
+  src/{main,raft_log,raft_node,raft_config}.c
+  tests/{test_smoke,test_config_cli}.sh
+  tests/{test_raft_log,test_raft_node,test_raft_config}.c
+  docs/architecture.md
+  README.md
+  progress.md
 ```
 
-## Design notes
+## Diagnostics
 
-Real log entries use **indices 1, 2, 3, ...**. The conceptual entry at index
-0 has term 0 but is not stored. Commands are binary-safe, individually owned
-by the log, and freed on truncation or destruction. Logs remain volatile until
-persistent storage is added in a later phase. Direct field modifications in
-the demo and tests do **not** imply implemented Raft elections or commitment.
+```sh
+# Run an individual unit test
+./build/test_raft_config
 
-This is a learning project, not production-ready infrastructure. Scope excludes
-snapshots, dynamic membership, and fully linearizable reads.
+# Trace configuration file system calls (optional)
+sudo dnf install -y strace
+strace -e trace=openat,read,close ./build/raft-engine --check-config config/node1.conf
 
-**Learning materials:** Per-phase PDFs are distributed separately and must not
-be committed. `.gitignore` excludes `*.pdf` and `learning-guides/`.
+# Debug the config loader in GDB
+gdb --args ./build/raft-engine --check-config config/node1.conf
+```
+
+The comprehensive Phase 3 learning PDF is distributed **outside** this
+repository. `.gitignore` excludes PDFs and `learning-guides/`.
+
+## Roadmap
+
+Next: Phase 4 - implement a TCP server that accepts peer connections.
+See `progress.md` for milestones and acceptance criteria.

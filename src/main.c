@@ -1,60 +1,76 @@
+#include "raft_config.h"
 #include "raft_node.h"
 
-#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
-static int run_demo(void)
+static int demo(void)
 {
     raft_node_t node;
-    if (raft_node_init(&node, 1) != RAFT_OK) {
-        fputs("Could not initialize demo node\n", stderr);
+    if (raft_node_init(&node, 1) != RAFT_OK) return 1;
+    const char *a = "SET x 1";
+    const char *b = "SET y 2";
+    node.current_term = 2;
+    if (raft_log_append(&node.log, 1, a, strlen(a)) != RAFT_OK ||
+        raft_log_append(&node.log, 2, b, strlen(b)) != RAFT_OK) {
+        raft_node_destroy(&node);
         return 1;
     }
-
-    node.current_term = 2;
-    const char first[] = "SET color blue";
-    const char second[] = "SET mode safe";
-    int result = 0;
-
-    if (raft_log_append(&node.log, 1, first, sizeof(first) - 1) != RAFT_OK ||
-        raft_log_append(&node.log, 2, second, sizeof(second) - 1) != RAFT_OK) {
-        fputs("Could not append demo log entries\n", stderr);
-        result = 1;
-    } else {
-        node.commit_index = 1;
-        node.last_applied = 1;
-        if (!raft_node_is_valid(&node)) {
-            fputs("Demo node invariants failed\n", stderr);
-            result = 1;
-        } else {
-            printf("Node: id=%" PRIu32 " role=%s term=%" PRIu64 "\n",
-                   node.id, raft_role_name(node.role), node.current_term);
-            printf("Log: entries=%zu last_index=%" PRIu64 "\n",
-                   node.log.count, raft_log_last_index(&node.log));
-            printf("Progress: committed=%" PRIu64 " applied=%" PRIu64 "\n",
-                   node.commit_index, node.last_applied);
-            puts("Demo only: no network, elections, or consensus yet.");
-        }
+    node.commit_index = 1;
+    node.last_applied = 1;
+    if (!raft_node_is_valid(&node)) {
+        raft_node_destroy(&node);
+        return 1;
     }
-
+    printf("Node: id=%u role=%s term=%llu\n", node.id,
+        raft_role_name(node.role), (unsigned long long)node.current_term);
+    printf("Log: entries=%zu last_index=%llu\n", node.log.count,
+        (unsigned long long)raft_log_last_index(&node.log));
+    printf("Progress: committed=%llu applied=%llu\n",
+        (unsigned long long)node.commit_index,
+        (unsigned long long)node.last_applied);
+    puts("Demo only: no network, elections, or consensus yet.");
     raft_node_destroy(&node);
-    return result;
+    return 0;
 }
 
-int main(int argc, char *argv[])
+static int check_config(const char *path)
 {
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("raft-engine 0.2.0");
-        return 0;
-    }
-    if (argc == 2 && strcmp(argv[1], "--demo") == 0) {
-        return run_demo();
-    }
-    if (argc != 1) {
-        fprintf(stderr, "Usage: raft-engine [--version|--demo]\n");
+    raft_cluster_config_t config;
+    char error[256];
+    raft_config_status_t status = raft_config_load_file(path, &config, error, sizeof(error));
+    if (status != RAFT_CONFIG_OK) {
+        fprintf(stderr, "Configuration %s: %s\n", raft_config_status_name(status), error);
         return 1;
     }
-    puts("Raft Engine initialized successfully.");
+    printf("Config valid: node_id=%u peers=%zu\n", config.node_id, config.peer_count);
+    for (size_t i = 0; i < config.peer_count; ++i) {
+        const raft_peer_config_t *peer = &config.peers[i];
+        printf("peer %u %s:%u%s\n", peer->id, peer->ipv4,
+            (unsigned int)peer->port, peer->id == config.node_id ? " (self)" : "");
+    }
+    puts("Config only: no sockets opened or nodes started.");
     return 0;
+}
+
+static void usage(void)
+{
+    fputs("Usage: raft-engine [--version | --demo | --check-config PATH]\n", stderr);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 1) {
+        puts("Raft Engine initialized successfully.");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        puts("raft-engine 0.1.0");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--demo") == 0) return demo();
+    if (argc == 3 && strcmp(argv[1], "--check-config") == 0)
+        return check_config(argv[2]);
+    usage();
+    return 1;
 }

@@ -1,57 +1,48 @@
-# Raft Engine architecture (Phase 2)
+# Raft Engine architecture (through Phase 3)
 
-This document describes **implemented code**, and distinguishes it from future
-components. As of Phase 2, this is **one single-process, in-memory model**.
+This page intentionally reflects implemented code, not aspirational features.
 
-## Current components
+## Module dependencies
 
 ```text
-            src/main.c
-                |
-                v
-           raft_node_t
-       +-------------------+
-       | id, role, term    |
-       | voted_for         |
-       | commit_index      |
-       | last_applied      |
-       | raft_log_t -------+---> entries[0..count-1]
-       +-------------------+         | each command is owned
-                                     | each entry has a term
+                     src/main.c
+                     /   |    \
+           raft_node  raft_log  raft_config
+               |         |          |
+               +---------+----------+
+                         |
+                    raft_types.h
 ```
 
-- `raft_types.h`: fixed-width identities, term and index types, roles, errors.
-- `raft_log.[ch]`: mutable, **volatile** log with dynamic storage. The real
-  entry at index `k >= 1` is stored at `entries[k-1]`. Index 0 is virtual.
-  `raft_log_append` deep-copies arbitrary bytes. `raft_log_truncate_from(k)`
-  frees the suffix starting at index k. A later phase will implement durable
-  storage and replication.
-- `raft_node.[ch]`: in-memory state container with a basic invariant checker.
-  `last_applied <= commit_index <= last_log_index` and local log terms cannot
-  exceed currentTerm. It does **not** implement election/consensus transitions.
-- `tests/`: unit tests validate ownership, indexing, validation, truncation,
-  capacity growth, initial state, and invalid node progress bounds.
+`raft_types.h` defines common ID/index/term/state types. `raft_log` owns a
+resizable sequence of binary command buffers. `raft_node` owns a log and tracks
+follower/candidate/leader state plus term, vote, commit and apply indices.
+`raft_config` parses, validates and sorts an immutable value-type set of three
+peer endpoints. It does **not** own external allocations.
 
-## Key invariants and caveats
+## Configuration design
 
-1. Valid node IDs start at 1; ID 0 is the `RAFT_NO_VOTE` sentinel.
-2. Every real entry has `term >= 1`; a missing virtual entry at index 0 has term 0.
-3. New entries may have equal or larger terms, never smaller terms.
-4. A caller still owns its input bytes; the log owns an independent copy.
-5. Each log/node must be initialized before use and destroyed before disposal.
-6. An entry pointer from `raft_log_at` can be invalidated by append or truncate.
-7. `raft_node_is_valid` checks structural consistency only. It does **not**
-   certify election safety, replication safety, or majority commitment.
-8. No thread safety, network messages, or durability exists in this phase.
+- Three independent files (`node1.conf`, `node2.conf`, `node3.conf`) all include
+  the same static membership list, and each selects a different `node_id`.
+- All addresses are IPv4 literals; no DNS, IPv6 or external libraries.
+- All nodes use loopback interfaces for local development.
+- A config is parsed into a zeroed temporary stack object; only after all
+  checks pass is it assigned to the caller's output (failure atomicity).
+- Numeric parsing checks both syntax and range instead of using `atoi`.
+- `inet_pton(AF_INET)` validates IP addresses; comparisons use numeric IPv4.
+- `peer` records are sorted for stable output; future transport may use IDs
+  rather than relying on file order.
 
-## Future phase boundaries
+## Invariants
 
-- Phase 3: configuration parsing and fixed-cluster settings.
-- Phases 4-6: TCP framing, inter-node communication, worker synchronization.
-- Phases 7-10: election timers, RequestVote, leadership, heartbeats.
-- Phases 11-15: replicated entries and quorum-based commitment.
-- Phases 19-21: durable term, vote, and log storage and restart recovery.
+1. `node_id > 0` and appears in the peer list.
+2. Exactly three unique nonzero peer IDs.
+3. Every `ipv4` is syntactically valid and every `port` is in `[1, 65535]`.
+4. No repeated numeric IPv4 address and port pair.
+5. Successful parse produces deterministic order; on failure output unchanged.
 
-The final project targets a fixed three-node distributed key-value store,
-not a production-ready consensus library. Dynamic membership, snapshots,
-and full linearizable read coordination are out of scope.
+## Next architectural layer
+
+Phase 4 will consume this configuration to create TCP listening sockets and
+accept peers. That implementation must handle partial reads, disconnections,
+timeouts, bind failures and safe shutdown. No network behavior exists now.
