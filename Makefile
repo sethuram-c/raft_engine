@@ -3,15 +3,16 @@ CPPFLAGS ?= -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -Werror -O0 -g
 LDFLAGS ?=
 LDLIBS ?=
+PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
 TEST_CONFIG = build/test_raft_config
 
-.PHONY: all run demo check-config test test-smoke test-unit clean
+.PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
@@ -48,8 +49,12 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
 
+test-network: $(APP)
+	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
+
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)
+	$(MAKE) test-network
 
 clean:
 	rm -rf build

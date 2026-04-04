@@ -6,7 +6,7 @@ printf 'PASS: version output\n'
 [ "$($binary)" = 'Raft Engine initialized successfully.' ]
 printf 'PASS: startup output\n'
 output=$($binary --demo)
-printf '%s\n' "$output" | grep -qF 'Demo only: no network'
+printf '%s\n' "$output" | grep -qF 'Demo only: no elections'
 printf 'PASS: Phase 2 Raft data demo\n'
 error_file=$(mktemp)
 trap 'rm -f "$error_file"' EXIT HUP INT TERM
