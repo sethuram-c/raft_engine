@@ -6,8 +6,8 @@
 #include <stddef.h>
 
 /*
- * Phase 4: TCP connectivity only. No wire protocol, authentication,
- * Raft RPC handling, data transfer, or concurrent clients yet.
+ * Phase 5: one framed PING per connection, optionally answered with PONG.
+ * No Raft RPCs, authentication, or concurrent clients yet.
  */
 #define RAFT_TCP_BACKLOG 16
 #define RAFT_TCP_CONNECT_TIMEOUT_MS 1000
@@ -29,7 +29,7 @@ int raft_tcp_connect(const raft_peer_config_t *peer, int timeout_ms,
 /* Accepts connections sequentially and immediately closes each accepted fd.
  * max_connections=0 serves until SIGINT or SIGTERM; otherwise exits after N.
  * Returns 0 on clean termination and -1 on listener/accept/poll error.
- * This demo intentionally does NOT handle Raft messages yet.
+ * This demo intentionally does NOT implement Raft messages yet.
  */
 int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,

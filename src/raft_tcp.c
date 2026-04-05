@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "raft_tcp.h"
+#include "raft_wire.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -13,8 +14,18 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 static volatile sig_atomic_t stop_requested = 0;
+
+/* Idle timeouts bound an unresponsive client; not an overall frame deadline. */
+static int configure_client_timeouts(int fd)
+{
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0 ? 0 : -1;
+}
+
 
 static void on_stop_signal(int signal_number)
 {
@@ -222,7 +233,31 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                config->node_id, accepted, address_text,
                (unsigned)ntohs(remote.sin_port));
         (void)fflush(stdout);
-        /* Phase 5 will define framing; no bytes are exchanged yet. */
+        if (configure_client_timeouts(client) != 0) {
+            fprintf(stderr, "Client socket timeout setup failed: %s\n", strerror(errno));
+            (void)close(client);
+            continue;
+        }
+        uint8_t payload[RAFT_WIRE_MAX_PAYLOAD];
+        raft_wire_type_t type;
+        size_t payload_length = 0;
+        char frame_error[256] = {0};
+        raft_wire_status_t frame_status =
+            raft_wire_recv(client, &type, payload, sizeof(payload),
+                           &payload_length, frame_error, sizeof(frame_error));
+        if (frame_status == RAFT_WIRE_OK && type == RAFT_WIRE_PING) {
+            frame_status = raft_wire_send(client, RAFT_WIRE_PONG,
+                                          payload, payload_length,
+                                          frame_error, sizeof(frame_error));
+            if (frame_status == RAFT_WIRE_OK) {
+                printf("Replied: node=%u bytes=%zu\n", config->node_id, payload_length);
+                (void)fflush(stdout);
+            }
+        } else if (frame_status == RAFT_WIRE_OK) {
+            fprintf(stderr, "Rejected frame: expected PING request\n");
+        }
+        if (frame_status != RAFT_WIRE_OK && frame_status != RAFT_WIRE_CLOSED)
+            fprintf(stderr, "Rejected frame: %s\n", frame_error);
         (void)close(client);
     }
 

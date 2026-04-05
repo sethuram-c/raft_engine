@@ -1,6 +1,7 @@
 #include "raft_config.h"
 #include "raft_node.h"
 #include "raft_tcp.h"
+#include "raft_wire.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -9,6 +10,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 static int demo(void)
 {
@@ -108,10 +111,78 @@ static int probe(const char *path, const char *peer_id_text)
     return 0;
 }
 
+static int ping_peer(const char *path, const char *peer_id_text,
+                     const char *message)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    if (peer_id_text == NULL || *peer_id_text == '\0' || *peer_id_text == '-') {
+        fputs("Invalid peer ID\n", stderr);
+        return 1;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long id = strtoul(peer_id_text, &end, 10);
+    if (errno == ERANGE || end == peer_id_text || *end != '\0' ||
+        id == 0 || id > UINT32_MAX) {
+        fputs("Invalid peer ID\n", stderr);
+        return 1;
+    }
+    const raft_peer_config_t *peer =
+        raft_config_peer_for_id(&config, (raft_node_id_t)id);
+    if (peer == NULL) {
+        fprintf(stderr, "Peer %lu not configured\n", id);
+        return 1;
+    }
+    size_t message_len = strlen(message);
+    if (message_len > RAFT_WIRE_MAX_PAYLOAD) {
+        fprintf(stderr, "Message exceeds %u-byte limit\n", RAFT_WIRE_MAX_PAYLOAD);
+        return 1;
+    }
+    char error[256];
+    int fd = raft_tcp_connect(peer, RAFT_TCP_CONNECT_TIMEOUT_MS,
+                              error, sizeof(error));
+    if (fd < 0) {
+        fprintf(stderr, "TCP ping connect failed: %s\n", error);
+        return 1;
+    }
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        fprintf(stderr, "TCP ping timeout setup failed: %s\n", strerror(errno));
+        (void)close(fd);
+        return 1;
+    }
+    uint8_t response[RAFT_WIRE_MAX_PAYLOAD];
+    raft_wire_type_t type = RAFT_WIRE_PING;
+    size_t response_len = 0;
+    raft_wire_status_t status = raft_wire_send(fd, RAFT_WIRE_PING,
+                                               message, message_len,
+                                               error, sizeof(error));
+    if (status == RAFT_WIRE_OK)
+        status = raft_wire_recv(fd, &type, response, sizeof(response),
+                                &response_len, error, sizeof(error));
+    (void)close(fd);
+    if (status != RAFT_WIRE_OK || type != RAFT_WIRE_PONG ||
+        response_len != message_len ||
+        memcmp(response, message, message_len) != 0) {
+        fprintf(stderr, "TCP ping failed: %s\n",
+                status == RAFT_WIRE_OK ? "PONG mismatch" : error);
+        return 1;
+    }
+    printf("PONG: local_node=%u peer=%u bytes=%zu message=", config.node_id,
+           peer->id, response_len);
+    (void)fwrite(response, 1, response_len, stdout);
+    putchar('\n');
+    puts("Demo only: no Raft RPC or consensus performed.");
+    return 0;
+}
+
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--serve PATH [--max-connections N] | --probe PATH PEER_ID]\n", stderr);
+          "--serve PATH [--max-connections N] | --probe PATH PEER_ID | "
+          "--ping PATH PEER_ID MESSAGE]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -143,6 +214,8 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && strcmp(argv[1], "--probe") == 0)
         return probe(argv[2], argv[3]);
+    if (argc == 5 && strcmp(argv[1], "--ping") == 0)
+        return ping_peer(argv[2], argv[3], argv[4]);
     usage();
     return 1;
 }

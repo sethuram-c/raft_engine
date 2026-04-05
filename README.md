@@ -1,32 +1,30 @@
 # Raft Engine
 
 A learning-oriented distributed key-value store under construction in **C11**
-on **Fedora Linux**, using **GNU Make** and a fixed three-node Raft cluster.
+on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 4 of 35.** Nodes now support TCP listeners and
-connection-only peer probes. **There is still no message framing, Raft RPC,
-leader election, replicated consensus, or working key-value store.**
+**Current milestone: Phase 5 / 35 - TCP message framing and serialization.**
+The application exchanges bounded, binary-safe **PING/PONG** messages over
+real TCP sockets. **This is not yet Raft RPC, leader election, replicated
+consensus, an authenticated peer transport, or a working key-value store.**
 
-## Features implemented so far
+## Implemented through Phase 5
 
-- Binary-safe, dynamically owned in-memory Raft log and basic node state.
-- Static three-node configuration parser with strict IPv4/port validation.
-- POSIX TCP listener: `socket` -> `setsockopt` -> `bind` -> `listen` -> `accept`.
-- CLI connection probe using nonblocking `connect`, `poll` and `SO_ERROR`.
-- Explicit descriptor cleanup and SIGINT/SIGTERM-controlled listener shutdown.
-- Integration tests using real loopback TCP connections and temporary ports.
+- Raft term/node/index types, heap-owned in-memory log and node lifecycle.
+- Strict three-node IPv4 configuration parser with uniqueness checks.
+- TCP listen/accept, bounded nonblocking connect, clean SIGINT/SIGTERM shutdown.
+- A 12-byte, network-byte-order header; exact-length send/receive helpers.
+- Wire header validation: magic, protocol version, type, reserved bytes and
+  maximum payload size (4096 bytes).
+- Sequential one-request-per-connection PING/PONG echo demonstration.
+- C unit tests and Python real-socket integration tests, including deliberately
+  fragmented TCP writes, binary payloads and malformed/truncated frames.
 
-The Phase 4 listener **immediately closes each accepted connection**. This is
-intentional: message framing and RPC handling arrive in later phases. A
-successful `--probe` only confirms a TCP handshake, not Raft health or an
-authenticated peer.
-
-## Fedora requirements
+## Prerequisites (Fedora)
 
 ```sh
 sudo dnf install -y gcc make python3 git gdb valgrind
-# Optional diagnostic utilities:
-sudo dnf install -y iproute netcat-openbsd strace tcpdump
+# Optional for inspection: sudo dnf install -y iproute strace tcpdump
 ```
 
 ## Build and test
@@ -39,71 +37,75 @@ make check-config
 make demo
 ```
 
-`make test` covers the prior log/node/config tests plus Phase 4 loopback TCP
-integration tests. The test creates temporary config files and chooses available
-local ports; it does not require the example ports 7001-7003 to be free.
+For debug diagnostics (separate from a normal build):
 
-## Run a node's TCP listener
+```sh
+make clean
+make CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' LDFLAGS='-fsanitize=address,undefined'
+make test CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' LDFLAGS='-fsanitize=address,undefined'
+make clean
+make
+```
 
-Terminal A:
+`make test` runs Phase 1-5 suites. Loopback tests select temporary endpoints,
+so example ports 7001-7003 do not have to be free.
+
+## Run the Phase 5 PING/PONG demo
+
+Terminal 1:
 
 ```sh
 ./build/raft-engine --serve config/node1.conf
 ```
 
-Expected initial line:
+Terminal 2:
 
-```text
-Listening: node=1 127.0.0.1:7001 (max_connections=0)
+```sh
+./build/raft-engine --ping config/node2.conf 1 hello-raft
 ```
 
-Terminal B (a separate process acting as node 2):
+Expected client output:
+
+```text
+PONG: local_node=2 peer=1 bytes=10 message=hello-raft
+Demo only: no Raft RPC or consensus performed.
+```
+
+The listener reports `Accepted:` and `Replied:` events. Press `Ctrl+C` in
+Terminal 1 to stop it. `--serve` accepts one framed request per connection,
+replies only to PING and closes the socket. It is sequential, not concurrent.
+
+The earlier Phase 4 connection-only command still works:
 
 ```sh
 ./build/raft-engine --probe config/node2.conf 1
 ```
 
-Expected:
+`--probe` does not send a frame. The listener closes it without sending a PONG.
+
+## The Phase 5 wire format
+
+Every frame is exactly **12-byte header + payload**:
+
+| Offset | Bytes | Meaning |
+| --- | ---: | --- |
+| 0 | 4 | Magic `0x52414654` (ASCII `RAFT`) |
+| 4 | 1 | Version: `1` |
+| 5 | 1 | Type: `1=PING`, `2=PONG` |
+| 6 | 2 | Reserved: must be zero |
+| 8 | 4 | Unsigned payload length, big-endian (0-4096) |
+| 12 | N | Opaque binary payload, not NUL terminated |
+
+Example `PING` for `abc` in hexadecimal:
 
 ```text
-Connected: local_node=2 peer=1 127.0.0.1:7001
-Probe only: no Raft messages sent.
+52 41 46 54  01 01  00 00  00 00 00 03  61 62 63
 ```
 
-Terminal A reports an accepted connection. Press `Ctrl+C` in Terminal A to
-stop it. `0` in the server status is the unlimited connection limit, not a
-maximum of zero connections.
+This wire encoding is a **teaching/demo transport**, not the final Raft RPC
+schema. Future RPCs will add term, node ID, log indices and message variants.
 
-Run a bounded listener that exits after two connections:
-
-```sh
-./build/raft-engine --serve config/node1.conf --max-connections 2
-```
-
-Run three listeners in three terminals (they listen independently; no Raft
-traffic flows between them yet):
-
-```sh
-./build/raft-engine --serve config/node1.conf
-./build/raft-engine --serve config/node2.conf
-./build/raft-engine --serve config/node3.conf
-```
-
-Use **one command per terminal** or launch them as separate background jobs.
-
-## Inspect listening sockets (Linux)
-
-```sh
-ss -ltnp | grep -E ':7001|:7002|:7003'
-```
-
-Inspect configured peers without opening a socket:
-
-```sh
-./build/raft-engine --check-config config/node1.conf
-```
-
-## CLI syntax
+## CLI
 
 ```text
 raft-engine --version
@@ -111,38 +113,20 @@ raft-engine --demo
 raft-engine --check-config PATH
 raft-engine --serve PATH [--max-connections POSITIVE_INTEGER]
 raft-engine --probe PATH PEER_ID
+raft-engine --ping PATH PEER_ID MESSAGE
 ```
 
-`--serve` uses the local node ID from its config, while `--probe` connects to
-the selected peer ID in the configuration and immediately closes the socket.
-`--probe` applies a 1000 ms connection timeout.
+## Limitations and trust model
 
-## Current limitations
+- IPv4 literals only; sample configs use `127.0.0.1`.
+- Single-threaded TCP listener handles one connection at a time.
+- 1-second socket **idle** timeouts are not total request deadlines.
+- No peer authentication, TLS, persistent connections or replay protection.
+- Protocol errors close only the affected connection; no error frame is sent.
+- PING and PONG are demonstrations, not Raft RPCs or health guarantees.
+- TCP packet boundaries do not equal message boundaries; reassembly is done
+  by `raft_wire_recv`, and multiple frames can be decoded from a stream.
+- Do not expose this learning server to untrusted networks.
 
-- IPv4 literals only; sample configs use loopback `127.0.0.1`.
-- No authentication, encryption, wire framing, heartbeat, or election logic.
-- Sequential, single-process accept loop; each connection is immediately closed.
-- No payload exchange, and no peer identity verification at the TCP layer.
-- Fixed membership of exactly three nodes; no cluster formation yet.
-- Manual demonstration ports can already be occupied by other applications.
-
-## Project structure
-
-```text
-raft-engine/
-  Makefile
-  config/node{1,2,3}.conf
-  include/{raft_types,raft_log,raft_node,raft_config,raft_tcp}.h
-  src/{main,raft_log,raft_node,raft_config,raft_tcp}.c
-  tests/{test_smoke,test_config_cli}.sh
-  tests/{test_raft_log,test_raft_node,test_raft_config}.c
-  tests/test_tcp_integration.py
-  docs/architecture.md
-  README.md
-  progress.md
-```
-
-The separate Phase 4 learning PDF is deliberately **not** in this repository.
-`.gitignore` excludes PDF files and `learning-guides/`.
-
-**Next:** Phase 5 - design and implement a framed Raft message protocol.
+The detailed Phase 5 learning PDF is a **separate local artifact** and is not
+stored in this repository. `.gitignore` excludes PDF and `learning-guides/`.

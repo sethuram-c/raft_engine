@@ -6,11 +6,12 @@ LDLIBS ?=
 PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
 TEST_CONFIG = build/test_raft_config
+TEST_WIRE = build/test_raft_wire
 
 .PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
@@ -26,6 +27,9 @@ $(TEST_NODE): tests/test_raft_node.c src/raft_node.c src/raft_log.c $(HEADERS) M
 
 $(TEST_CONFIG): tests/test_raft_config.c src/raft_config.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_config.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
+
+$(TEST_WIRE): tests/test_raft_wire.c src/raft_wire.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_wire.c src/raft_wire.c $(LDFLAGS) $(LDLIBS) -o $@
 
 build:
 	mkdir -p build
@@ -44,13 +48,15 @@ check-config: $(APP)
 test-smoke: $(APP)
 	sh tests/test_smoke.sh ./$(APP)
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG)
+test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE)
 	./$(TEST_LOG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
+	./$(TEST_WIRE)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
+	$(PYTHON) tests/test_wire_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

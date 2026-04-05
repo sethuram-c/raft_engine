@@ -57,3 +57,45 @@ feat: add TCP listeners and peer connectivity probes
 
 **Scope limit:** The accept loop closes each accepted descriptor immediately.
 Raft RPCs and framed messages belong to later phases. No consensus yet.
+
+## Phase 5 / 35 - TCP message framing and serialization
+
+**Time budget:** ~2 hours  
+**Planned milestone:** January 5, 2027 (record actual commit time)
+
+### Deliverable
+
+A portable-on-the-wire, versioned, length-prefixed PING/PONG frame protocol
+used by two independent Linux processes. Binary payloads are length-tracked,
+validated and bounded to 4096 bytes. The listener handles one frame per
+connection, echoes PING as PONG and closes the socket.
+
+### Acceptance criteria
+
+- [x] Explicit network-order 12-byte header with magic/version/type/length
+- [x] Reject unknown types, reserved flags, bad versions and oversize lengths
+- [x] send/recv exact-byte loops support partial TCP I/O
+- [x] Clean EOF distinguished from truncated header or payload
+- [x] Binary-safe payloads including zero bytes and zero-length frames
+- [x] PING/PONG exchange across real independent processes
+- [x] Previous Phase 1-4 tests still pass
+- [x] Malformed frame integration tests use loopback and temporary ports
+- [ ] Run all acceptance tests on your personal Fedora machine
+- [ ] Review and commit with an actual completion timestamp
+
+### Verify
+
+```sh
+make clean && make && make test
+# terminal 1: ./build/raft-engine --serve config/node1.conf
+# terminal 2: ./build/raft-engine --ping config/node2.conf 1 hello-raft
+```
+
+### Commit message
+
+```text
+feat: add bounded TCP framing and binary-safe ping pong messages
+```
+
+**Scope limit:** Not real Raft RPC or a concurrent server. Threaded request
+handling is planned for Phase 6. Personal learning PDF stays outside Git.

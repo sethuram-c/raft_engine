@@ -95,11 +95,12 @@ def main(binary: str) -> None:
                   "Connected: local_node=2 peer=1" in result.stdout,
                   "peer-to-peer probe connects to listener")
 
-            # A raw Python client also connects, and sees EOF (no protocol yet).
+            # A raw client sends no frame and eventually sees EOF.
+            # Since Phase 5 the listener waits for a bounded receive timeout.
             port1 = int(config[0].read_text().split("\n")[1].rsplit(",", 1)[-1])
             with socket.create_connection(("127.0.0.1", port1), timeout=2) as sock:
                 sock.settimeout(2)
-                check(sock.recv(1) == b"", "accepted socket closed without protocol bytes")
+                check(sock.recv(1) == b"", "connection without a frame receives no protocol response")
 
             output, errors = node1.communicate(timeout=5)
             check(node1.returncode == 0 and
