@@ -84,3 +84,40 @@ leader election, peer identity authentication, quorum logic, or key-value
 state machine. PING/PONG is only proof that framing is reliable over TCP.
 
 **Next phase:** Concurrent connection handling using POSIX threads and mutexes.
+
+
+## Phase 6: Bounded concurrent TCP server
+
+```text
+              ┌────────── TCP listening socket ──────────┐
+              │               Accept thread              │
+              │ poll -> accept -> select free worker slot│
+              └──────────────────┬───────────────────────┘
+                                 │ pthread_create
+                     ┌───────────┴────────────┐
+                     │ 8 maximum worker slots│
+                     │ worker -> recv PING    │
+                     │        -> send PONG    │
+                     │        -> close socket │
+                     └───────────┬────────────┘
+                                 │ mutex + condition
+                              join & reuse
+```
+
+The accept loop owns the listener and worker slot allocation. Each worker
+owns its accepted socket. The mutex synchronizes the workers' completed
+flags and socket closure with the accept thread's stop-time `shutdown()`.
+The condition variable wakes the accept loop when capacity becomes available.
+A worker slot is **never reused before `pthread_join`**. Full capacity means
+waiting rather than creating unlimited threads; pending connects may queue
+in the operating system's listen backlog.
+
+`--max-connections N` counts accepted sockets and normally waits for all
+accepted work to drain before exit. On SIGINT/SIGTERM, the main thread
+interrupts workers' sockets with `shutdown()`, joins threads and restores
+the previous signal handlers. The signal handler itself only sets a
+`volatile sig_atomic_t` flag.
+
+Threat model: this is an educational localhost TCP demo with no auth or
+Raft RPCs. One-second **idle** I/O timeouts do not bound the complete
+request lifetime against slow clients.

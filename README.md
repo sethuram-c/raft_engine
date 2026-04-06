@@ -3,12 +3,13 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 5 / 35 - TCP message framing and serialization.**
+**Current milestone: Phase 6 / 35 - Bounded concurrent TCP server.**
 The application exchanges bounded, binary-safe **PING/PONG** messages over
-real TCP sockets. **This is not yet Raft RPC, leader election, replicated
+real TCP sockets, now using a bounded pool of POSIX worker threads.
+**This is not yet Raft RPC, leader election, replicated
 consensus, an authenticated peer transport, or a working key-value store.**
 
-## Implemented through Phase 5
+## Implemented through Phase 6
 
 - Raft term/node/index types, heap-owned in-memory log and node lifecycle.
 - Strict three-node IPv4 configuration parser with uniqueness checks.
@@ -16,9 +17,13 @@ consensus, an authenticated peer transport, or a working key-value store.**
 - A 12-byte, network-byte-order header; exact-length send/receive helpers.
 - Wire header validation: magic, protocol version, type, reserved bytes and
   maximum payload size (4096 bytes).
-- Sequential one-request-per-connection PING/PONG echo demonstration.
+- Concurrent one-request-per-connection PING/PONG echo with up to 8 POSIX
+  worker threads, mutex-protected completion, and condition-variable wakeups.
+- The accept loop waits for a free worker instead of creating unlimited threads.
+- Graceful worker cleanup on SIGINT/SIGTERM, including socket shutdown and joins.
 - C unit tests and Python real-socket integration tests, including deliberately
-  fragmented TCP writes, binary payloads and malformed/truncated frames.
+  fragmented TCP writes, binary payloads, malformed/truncated frames,
+  simultaneous clients, worker saturation, and signal-driven shutdown.
 
 ## Prerequisites (Fedora)
 
@@ -47,10 +52,10 @@ make clean
 make
 ```
 
-`make test` runs Phase 1-5 suites. Loopback tests select temporary endpoints,
+`make test` runs Phase 1-6 suites. Loopback tests select temporary endpoints,
 so example ports 7001-7003 do not have to be free.
 
-## Run the Phase 5 PING/PONG demo
+## Run the Phase 6 concurrent PING/PONG demo
 
 Terminal 1:
 
@@ -73,7 +78,16 @@ Demo only: no Raft RPC or consensus performed.
 
 The listener reports `Accepted:` and `Replied:` events. Press `Ctrl+C` in
 Terminal 1 to stop it. `--serve` accepts one framed request per connection,
-replies only to PING and closes the socket. It is sequential, not concurrent.
+replies only to PING and closes the socket. It handles up to eight clients concurrently; excess connections wait
+in the kernel TCP accept backlog while workers are busy. On SIGTERM or
+SIGINT, active sockets are interrupted and all workers are joined.
+
+Try several concurrent pings in a second terminal:
+
+```sh
+for i in $(seq 1 6); do ./build/raft-engine --ping config/node2.conf 1 "request-$i" & done
+wait
+```
 
 The earlier Phase 4 connection-only command still works:
 
@@ -119,8 +133,10 @@ raft-engine --ping PATH PEER_ID MESSAGE
 ## Limitations and trust model
 
 - IPv4 literals only; sample configs use `127.0.0.1`.
-- Single-threaded TCP listener handles one connection at a time.
-- 1-second socket **idle** timeouts are not total request deadlines.
+- Bounded thread-per-connection model (8 workers); this is not a production
+  event-driven reactor or independently sized job queue.
+- 1-second socket **idle** timeouts are not total frame deadlines; a slow
+  client may stay connected by trickling bytes, so use localhost only.
 - No peer authentication, TLS, persistent connections or replay protection.
 - Protocol errors close only the affected connection; no error frame is sent.
 - PING and PONG are demonstrations, not Raft RPCs or health guarantees.
@@ -128,5 +144,17 @@ raft-engine --ping PATH PEER_ID MESSAGE
   by `raft_wire_recv`, and multiple frames can be decoded from a stream.
 - Do not expose this learning server to untrusted networks.
 
-The detailed Phase 5 learning PDF is a **separate local artifact** and is not
+The detailed Phase 6 learning PDF is a **separate local artifact** and is not
 stored in this repository. `.gitignore` excludes PDF and `learning-guides/`.
+
+## Worker ownership model (Phase 6)
+
+- The accept thread exclusively owns the listening socket and worker table.
+- A worker owns exactly one accepted client socket until it closes it.
+- The `pthread_mutex_t` protects socket-close/shutdown coordination and
+  the `finished` flags; `pthread_cond_t` signals a newly free slot.
+- Worker slots are reused only **after `pthread_join`**, preventing leaks.
+- `--max-connections N` limits **accepted** connections, not simultaneous
+  threads; after N connections the server drains remaining workers.
+- On SIGINT/SIGTERM the main thread calls `shutdown()` on each active client
+  while holding the mutex, joins them all, and restores its signal handlers.

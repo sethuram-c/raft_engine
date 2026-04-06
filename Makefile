@@ -2,6 +2,7 @@ CC = gcc
 CPPFLAGS ?= -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -Werror -O0 -g
 LDFLAGS ?=
+THREAD_FLAGS = -pthread
 LDLIBS ?=
 PYTHON ?= python3
 
@@ -17,19 +18,19 @@ TEST_WIRE = build/test_raft_wire
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) src/main.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_LOG): tests/test_raft_log.c src/raft_log.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_log.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_log.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_NODE): tests/test_raft_node.c src/raft_node.c src/raft_log.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_node.c src/raft_node.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_node.c src/raft_node.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_CONFIG): tests/test_raft_config.c src/raft_config.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_config.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_config.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_WIRE): tests/test_raft_wire.c src/raft_wire.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_raft_wire.c src/raft_wire.c $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_wire.c src/raft_wire.c $(LDFLAGS) $(LDLIBS) -o $@
 
 build:
 	mkdir -p build
@@ -57,6 +58,7 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE)
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
 	$(PYTHON) tests/test_wire_integration.py ./$(APP)
+	$(PYTHON) tests/test_concurrent_tcp.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

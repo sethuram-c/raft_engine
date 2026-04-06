@@ -99,3 +99,47 @@ feat: add bounded TCP framing and binary-safe ping pong messages
 
 **Scope limit:** Not real Raft RPC or a concurrent server. Threaded request
 handling is planned for Phase 6. Personal learning PDF stays outside Git.
+
+## Phase 6 / 35 - Concurrent connection handling with POSIX threads
+
+**Time budget:** ~2 hours  
+**Planned milestone:** January 6, 2027 (use actual commit date)
+
+### Deliverable
+
+A bounded eight-worker POSIX threaded TCP server that can answer multiple
+PINGs without head-of-line blocking behind one stalled client. Idle workers
+are joined and reused; full capacity applies backpressure. SIGINT/SIGTERM
+interrupts active sockets and waits for threads to finish.
+
+### Acceptance criteria
+
+- [x] `-pthread` compile/link support in GNU Make
+- [x] Exactly eight maximum concurrent connection workers
+- [x] Mutex protects socket lifetime and worker completion flags
+- [x] Condition variable avoids spinning while full
+- [x] Join completed workers before reusing slots
+- [x] PING/PONG remains compatible with Phase 5 protocol
+- [x] Parallel clients finish while another client stalls
+- [x] A ninth connection waits for an available worker
+- [x] SIGTERM gracefully interrupts waiting workers and joins them
+- [x] All previous tests still pass
+- [ ] Verify on Fedora hardware and review output
+- [ ] Commit source files using real completion date
+
+### Verify
+
+```sh
+make clean && make && make test
+# terminal 1: ./build/raft-engine --serve config/node1.conf
+# terminal 2: for i in $(seq 1 6); do ./build/raft-engine --ping config/node2.conf 1 "request-$i" & done; wait
+```
+
+### Commit message
+
+```text
+feat: handle concurrent TCP clients with bounded pthread workers
+```
+
+**Scope limit:** Real Raft RPCs and leader election are NOT implemented.
+The separate Phase 6 study PDF must not enter Git.

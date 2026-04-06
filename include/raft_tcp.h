@@ -6,8 +6,8 @@
 #include <stddef.h>
 
 /*
- * Phase 5: one framed PING per connection, optionally answered with PONG.
- * No Raft RPCs, authentication, or concurrent clients yet.
+ * Phase 6: a bounded number of POSIX worker threads respond to framed PINGs.
+ * No Raft RPCs, authentication, or consensus yet.
  */
 #define RAFT_TCP_BACKLOG 16
 #define RAFT_TCP_CONNECT_TIMEOUT_MS 1000
@@ -26,9 +26,12 @@ int raft_tcp_listen(const raft_peer_config_t *local,
 int raft_tcp_connect(const raft_peer_config_t *peer, int timeout_ms,
                      char *error, size_t error_capacity);
 
-/* Accepts connections sequentially and immediately closes each accepted fd.
- * max_connections=0 serves until SIGINT or SIGTERM; otherwise exits after N.
- * Returns 0 on clean termination and -1 on listener/accept/poll error.
+/* Accepts clients into a bounded worker pool (8 concurrent requests).
+ * When all workers are busy, the accept loop waits for a free slot; the
+ * kernel listen backlog holds queued connections.
+ * max_connections=0 serves until SIGINT or SIGTERM; otherwise drains and
+ * exits after N accepted connections. Signals interrupt active sockets.
+ * Returns 0 on clean termination and -1 on fatal server errors.
  * This demo intentionally does NOT implement Raft messages yet.
  */
 int raft_tcp_serve(const raft_cluster_config_t *config,
