@@ -121,3 +121,26 @@ the previous signal handlers. The signal handler itself only sets a
 Threat model: this is an educational localhost TCP demo with no auth or
 Raft RPCs. One-second **idle** I/O timeouts do not bound the complete
 request lifetime against slow clients.
+
+## Phase 7: follower election timeout
+
+`raft_timer.h` and `raft_timer.c` implement a single randomized deadline for
+future Raft election triggering. `CLOCK_MONOTONIC` gives a real elapsed-time
+sample, while `raft_election_timer_reset(timer, now_ms)` accepts caller-supplied
+logical time to make boundary tests deterministic. A per-node xorshift32 state
+produces timeouts in [350, 700] ms, inclusive. The random source is NOT
+cryptographic; production election seeds should derive from OS entropy so
+nodes do not repeat identical timeout sequences after restarts.
+
+`raft_node_start_follower()` initializes/arms the timer and selects follower
+role without modifying `current_term` or `voted_for`.
+`raft_node_reset_follower_timeout()` re-arms the timer only while the node is
+a follower. A future validated AppendEntries/RequestVote handler can call
+this reset; raw bytes, failed requests and unverified network traffic must NOT
+reset the follower election timer. `raft_node_follower_timeout_pending()`
+reports a boolean and does not transition to candidate yet.
+
+This library is not thread-safe: future Raft event-processing code must own
+one node's state or protect node/timer operations under a mutex. The existing
+Phase 6 TCP worker pool remains a separate PING/PONG demo and does not access
+Raft node state. No heartbeat, election RPC, persistent vote, or consensus yet.

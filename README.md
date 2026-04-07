@@ -3,13 +3,13 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 6 / 35 - Bounded concurrent TCP server.**
+**Current milestone: Phase 7 / 35 - Follower election timers.**
 The application exchanges bounded, binary-safe **PING/PONG** messages over
 real TCP sockets, now using a bounded pool of POSIX worker threads.
 **This is not yet Raft RPC, leader election, replicated
 consensus, an authenticated peer transport, or a working key-value store.**
 
-## Implemented through Phase 6
+## Implemented through Phase 7
 
 - Raft term/node/index types, heap-owned in-memory log and node lifecycle.
 - Strict three-node IPv4 configuration parser with uniqueness checks.
@@ -21,6 +21,8 @@ consensus, an authenticated peer transport, or a working key-value store.**
   worker threads, mutex-protected completion, and condition-variable wakeups.
 - The accept loop waits for a free worker instead of creating unlimited threads.
 - Graceful worker cleanup on SIGINT/SIGTERM, including socket shutdown and joins.
+- Randomized, monotonic follower election deadlines (350-700 ms) with
+  deterministic, clock-injected tests; no candidacy or vote RPCs yet.
 - C unit tests and Python real-socket integration tests, including deliberately
   fragmented TCP writes, binary payloads, malformed/truncated frames,
   simultaneous clients, worker saturation, and signal-driven shutdown.
@@ -52,8 +54,35 @@ make clean
 make
 ```
 
-`make test` runs Phase 1-6 suites. Loopback tests select temporary endpoints,
+`make test` runs Phase 1-7 suites. Loopback tests select temporary endpoints,
 so example ports 7001-7003 do not have to be free.
+
+## Run the Phase 7 follower timer demonstration
+
+```sh
+./build/raft-engine --timer-demo config/node1.conf
+./build/test_raft_timer
+```
+
+Expected output shape (randomized timeout values may differ with seeds):
+
+```text
+Follower timer: node=1 role=follower timeout_ms=519
+At deadline-1: timeout_pending=0
+At deadline: timeout_pending=1
+After reset: timeout_pending=0 next_timeout_ms=501
+Demo only: no candidate transition, voting, or leader election yet.
+```
+
+`--timer-demo` samples CLOCK_MONOTONIC once, then injects artificial timestamps
+for repeatable boundary checks. It does not run a background timer, start a
+cluster, send vote requests, or elect a leader. A seed derived from node ID
+is used only to make this CLI example reproducible; production seeds will use
+OS entropy in a later phase.
+
+The timeout uses milliseconds, never wall-clock dates. The phase does not
+integrate election timer mutation into the concurrently running TCP server:
+that requires a serialized Raft event loop or explicit synchronization.
 
 ## Run the Phase 6 concurrent PING/PONG demo
 
@@ -128,6 +157,7 @@ raft-engine --check-config PATH
 raft-engine --serve PATH [--max-connections POSITIVE_INTEGER]
 raft-engine --probe PATH PEER_ID
 raft-engine --ping PATH PEER_ID MESSAGE
+raft-engine --timer-demo PATH
 ```
 
 ## Limitations and trust model
@@ -144,7 +174,7 @@ raft-engine --ping PATH PEER_ID MESSAGE
   by `raft_wire_recv`, and multiple frames can be decoded from a stream.
 - Do not expose this learning server to untrusted networks.
 
-The detailed Phase 6 learning PDF is a **separate local artifact** and is not
+The detailed phase learning PDFs are **separate local artifacts** and is not
 stored in this repository. `.gitignore` excludes PDF and `learning-guides/`.
 
 ## Worker ownership model (Phase 6)

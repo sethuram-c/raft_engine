@@ -178,11 +178,45 @@ static int ping_peer(const char *path, const char *peer_id_text,
     return 0;
 }
 
+/* Logical-time example: no waiting, network traffic, voting, or role change. */
+static int timer_demo(const char *path)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    raft_node_t node;
+    if (raft_node_init(&node, config.node_id) != RAFT_OK) return 1;
+    uint64_t now_ms;
+    if (raft_clock_monotonic_ms(&now_ms) != RAFT_OK ||
+        raft_node_start_follower(&node, now_ms,
+                                 0x9E3779B9U ^ config.node_id) != RAFT_OK) {
+        raft_node_destroy(&node);
+        fputs("Could not initialize follower election timer\n", stderr);
+        return 1;
+    }
+    uint64_t deadline = node.election_timer.deadline_ms;
+    printf("Follower timer: node=%u role=%s timeout_ms=%u\n",
+           node.id, raft_role_name(node.role), node.election_timer.timeout_ms);
+    printf("At deadline-1: timeout_pending=%d\n",
+           raft_node_follower_timeout_pending(&node, deadline - 1));
+    printf("At deadline: timeout_pending=%d\n",
+           raft_node_follower_timeout_pending(&node, deadline));
+    if (raft_node_reset_follower_timeout(&node, deadline) != RAFT_OK) {
+        raft_node_destroy(&node);
+        return 1;
+    }
+    printf("After reset: timeout_pending=%d next_timeout_ms=%u\n",
+           raft_node_follower_timeout_pending(&node, deadline),
+           node.election_timer.timeout_ms);
+    puts("Demo only: no candidate transition, voting, or leader election yet.");
+    raft_node_destroy(&node);
+    return 0;
+}
+
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
           "--serve PATH [--max-connections N] | --probe PATH PEER_ID | "
-          "--ping PATH PEER_ID MESSAGE]\n", stderr);
+          "--ping PATH PEER_ID MESSAGE | --timer-demo PATH]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -196,6 +230,8 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--demo") == 0) return demo();
+    if (argc == 3 && strcmp(argv[1], "--timer-demo") == 0)
+        return timer_demo(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--check-config") == 0)
         return check_config(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)

@@ -143,3 +143,45 @@ feat: handle concurrent TCP clients with bounded pthread workers
 
 **Scope limit:** Real Raft RPCs and leader election are NOT implemented.
 The separate Phase 6 study PDF must not enter Git.
+
+## Phase 7 / 35 - Follower state and randomized election timers
+
+**Time budget:** ~2 hours  
+**Planned milestone:** January 7, 2027 (record actual commit time)
+
+### Deliverable
+
+A monotonic-clock-backed randomized election timeout module wired into the
+Raft follower state, with an injectable logical timestamp for deterministic
+unit tests and a `--timer-demo` CLI. The timer reports when an election would
+be due, but it deliberately does not change the node to candidate or send RPCs.
+
+### Acceptance criteria
+
+- [x] Read real elapsed time with CLOCK_MONOTONIC
+- [x] Independently seeded repeatable xorshift32 jitter within 350-700 ms
+- [x] Timer reset, expiry and remaining-time APIs
+- [x] Deadline inclusivity and uint64 overflow checks
+- [x] Role-gated follower timeout query; role/term/vote invariants preserved
+- [x] CLI demo with two checks at the exact deadline boundary and a reset
+- [x] Timer tests for invalid inputs, randomness, clock and follower lifecycle
+- [x] All earlier smoke, unit and network integration tests continue to pass
+- [ ] Reproduce the tests on your own Fedora workstation
+- [ ] Review and commit source with the actual completion timestamp
+
+### Verify
+
+```sh
+make clean && make && make test
+./build/raft-engine --timer-demo config/node1.conf
+```
+
+### Commit message
+
+```text
+feat: add randomized follower election timers with monotonic deadlines
+```
+
+**Scope limit:** This phase does not implement RequestVote, leader election,
+heartbeat validation, shared-state locking, or timers on live network nodes.
+The learning PDF stays outside the Git repo.
