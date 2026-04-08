@@ -111,7 +111,7 @@ def main(binary: str) -> None:
             for tag, mutation in [
                 ("wrong magic", {"magic": 0}),
                 ("wrong version", {"version": 2}),
-                ("unknown message type", {"type": 3}),
+                ("unknown message type", {"type": 99}),
                 ("reserved flags", {"flags": 1}),
                 ("oversized declared length", {"length": MAX_PAYLOAD + 1}),
             ]:

@@ -144,3 +144,30 @@ This library is not thread-safe: future Raft event-processing code must own
 one node's state or protect node/timer operations under a mutex. The existing
 Phase 6 TCP worker pool remains a separate PING/PONG demo and does not access
 Raft node state. No heartbeat, election RPC, persistent vote, or consensus yet.
+
+## Phase 8: RequestVote RPC (implemented)
+
+One TCP connection carries one 12-byte RAFT frame header followed by a fixed
+28-byte RequestVote request or 9-byte response. Request fields in network order:
+`term:u64`, `candidate_id:u32`, `last_log_index:u64`, `last_log_term:u64`.
+Response: `term:u64`, `vote_granted:u8` where the flag is 0 or 1. The
+frame type is 3 (request) or 4 (response).
+
+The receiver checks the candidate is a distinct configured cluster member,
+decodes into a temporary struct, locks its state mutex, applies the Raft vote
+rules, unlocks, then replies. The same mutex also guards concurrent worker
+shutdown accounting; lock hold time is limited to memory-only state mutation.
+
+Follower RequestVote rules: reject terms lower than `current_term`; first
+adopt a higher term and clear the vote; grant only when the candidate log is
+at least as up-to-date (last term first, then last index) and the voter has
+not already voted for a different candidate this term. Granting resets the
+follower election timer. Rejecting does not reset it. A higher term also
+forces a leader/candidate to become follower even if the vote is rejected.
+
+**Critical safety limitations:** `current_term` and `voted_for` are not
+persisted to stable storage (planned later); process restarts can grant votes
+again in the same term. Peer identity is inferred from a self-declared ID,
+not authenticated; TCP is loopback demo transport. No candidate state machine,
+quorum calculation, leader selection or AppendEntries exists yet. Thus Phase
+8 is an RPC milestone, not a functioning consensus algorithm.

@@ -185,3 +185,24 @@ feat: add randomized follower election timers with monotonic deadlines
 **Scope limit:** This phase does not implement RequestVote, leader election,
 heartbeat validation, shared-state locking, or timers on live network nodes.
 The learning PDF stays outside the Git repo.
+
+## Phase 8 / 35 - RequestVote RPC and follower vote rules
+
+**Deliverable:** bounded, binary-safe RequestVote request/response RPC over
+real TCP with shared synchronized in-memory term/vote state.
+
+- [x] Add `raft_vote.h` and `raft_vote.c` with strict big-endian codec
+- [x] Add RequestVote / response message types to existing wire frame
+- [x] Implement Raft term, single-vote and candidate-log freshness checks
+- [x] Reset election timeout only for granted votes
+- [x] Serialize worker-thread vote decisions under mutex
+- [x] Reject candidate IDs not in the configured cluster
+- [x] Implement one-shot `--request-vote` CLI
+- [x] Cover raw protocol, vote decisions, malformed messages and TCP races
+- [x] Preserve earlier phase tests under normal GCC build
+
+Acceptance criteria: `make`, `make test`, and raw TCP RequestVote integration
+should succeed on Fedora Linux. Do not confuse a granted vote with a leader
+election: candidacy, self-voting, majority counting and heartbeats are later.
+Current term and votes are **not durable**; the server is not safe for real
+Raft elections after process restarts. Private learning PDF stays outside Git.

@@ -2,6 +2,7 @@
 
 #include "raft_tcp.h"
 #include "raft_wire.h"
+#include "raft_vote.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -190,26 +191,55 @@ struct tcp_server {
     pthread_cond_t worker_changed;
     tcp_worker_t workers[RAFT_TCP_MAX_WORKERS];
     raft_node_id_t node_id;
+    raft_node_t vote_node; /* Protected by server->mutex. Memory-only Phase 8. */
+    raft_cluster_config_t config; /* Fixed set of allowed candidate IDs. */
 };
 
-static void process_client(int fd, raft_node_id_t node_id)
+static void process_client(int fd, tcp_server_t *server)
 {
     uint8_t payload[RAFT_WIRE_MAX_PAYLOAD];
     raft_wire_type_t type;
     size_t length = 0;
     char message[256] = {0};
-
     raft_wire_status_t status = raft_wire_recv(fd, &type, payload,
-                                  sizeof(payload), &length, message, sizeof(message));
+                                   sizeof(payload), &length, message, sizeof(message));
     if (status == RAFT_WIRE_OK && type == RAFT_WIRE_PING) {
         status = raft_wire_send(fd, RAFT_WIRE_PONG, payload, length,
                                 message, sizeof(message));
         if (status == RAFT_WIRE_OK) {
-            printf("Replied: node=%u bytes=%zu\n", node_id, length);
+            printf("Replied: node=%u bytes=%zu\n", server->node_id, length);
+            (void)fflush(stdout);
+        }
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_REQUEST_VOTE) {
+        raft_vote_request_t req;
+        raft_vote_response_t rsp;
+        uint8_t output[RAFT_VOTE_RESPONSE_BYTES];
+        uint64_t now_ms = 0;
+        if (raft_vote_decode_request(payload, length, &req) != RAFT_OK ||
+            raft_config_peer_for_id(&server->config, req.candidate_id) == NULL ||
+            req.candidate_id == server->node_id ||
+            raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
+            fputs("Rejected malformed RequestVote payload\n", stderr);
+            return;
+        }
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_status_t result = raft_vote_handle(&server->vote_node, &req, now_ms, &rsp);
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (result != RAFT_OK ||
+            raft_vote_encode_response(&rsp, output) != RAFT_OK) {
+            fputs("Could not process RequestVote\n", stderr);
+            return;
+        }
+        status = raft_wire_send(fd, RAFT_WIRE_REQUEST_VOTE_RESPONSE,
+                                output, sizeof(output), message, sizeof(message));
+        if (status == RAFT_WIRE_OK) {
+            printf("RequestVote: node=%u candidate=%u term=%llu granted=%d\n",
+                   server->node_id, req.candidate_id,
+                   (unsigned long long)rsp.term, rsp.vote_granted);
             (void)fflush(stdout);
         }
     } else if (status == RAFT_WIRE_OK) {
-        fputs("Rejected frame: expected PING request\n", stderr);
+        fputs("Rejected frame: expected PING or RequestVote request\n", stderr);
     }
     if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
         fprintf(stderr, "Rejected frame: %s\n", message);
@@ -221,7 +251,7 @@ static void *tcp_worker_main(void *arg)
     tcp_server_t *server = worker->server;
     int fd = worker->client_fd;
     if (configure_client_timeouts(fd) == 0)
-        process_client(fd, server->node_id);
+        process_client(fd, server);
     else
         fprintf(stderr, "Client socket timeout setup failed: %s\n", strerror(errno));
 
@@ -246,6 +276,20 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     if (code != 0) {
         (void)pthread_mutex_destroy(&server->mutex);
         return code;
+    }
+    if (raft_node_init(&server->vote_node, node_id) != RAFT_OK) {
+        (void)pthread_cond_destroy(&server->worker_changed);
+        (void)pthread_mutex_destroy(&server->mutex);
+        return EINVAL;
+    }
+    uint64_t now_ms = 0;
+    if (raft_clock_monotonic_ms(&now_ms) != RAFT_OK ||
+        raft_node_start_follower(&server->vote_node, now_ms,
+                                 0x9E3779B9U ^ node_id) != RAFT_OK) {
+        raft_node_destroy(&server->vote_node);
+        (void)pthread_cond_destroy(&server->worker_changed);
+        (void)pthread_mutex_destroy(&server->mutex);
+        return EINVAL;
     }
     return 0;
 }
@@ -306,6 +350,7 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
             server->workers[i].in_use = false;
         }
     }
+    raft_node_destroy(&server->vote_node);
     (void)pthread_cond_destroy(&server->worker_changed);
     (void)pthread_mutex_destroy(&server->mutex);
 }
@@ -323,6 +368,7 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
 
     tcp_server_t server;
     int code = tcp_server_init(&server, config->node_id);
+    if (code == 0) server.config = *config;
     if (code != 0) {
         report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
         (void)close(listener);

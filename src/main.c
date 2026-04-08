@@ -2,6 +2,7 @@
 #include "raft_node.h"
 #include "raft_tcp.h"
 #include "raft_wire.h"
+#include "raft_vote.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -178,6 +179,85 @@ static int ping_peer(const char *path, const char *peer_id_text,
     return 0;
 }
 
+/* Phase 8: send exactly one RequestVote RPC to a configured peer. */
+static int parse_decimal_u64(const char *text, uint64_t *out)
+{
+    if (text == NULL || out == NULL || *text == '\0' || *text == '-' || *text == '+')
+        return -1;
+    for (const char *p = text; *p != '\0'; ++p)
+        if (*p < '0' || *p > '9') return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0') return -1;
+    *out = (uint64_t)value;
+    return 0;
+}
+
+static int request_vote_peer(const char *path, const char *peer_text,
+                             const char *term_text, const char *index_text,
+                             const char *log_term_text)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    uint64_t peer_id, term, last_index, last_term;
+    if (parse_decimal_u64(peer_text, &peer_id) != 0 ||
+        parse_decimal_u64(term_text, &term) != 0 ||
+        parse_decimal_u64(index_text, &last_index) != 0 ||
+        parse_decimal_u64(log_term_text, &last_term) != 0 ||
+        peer_id == 0 || peer_id > UINT32_MAX || peer_id == config.node_id) {
+        fputs("Invalid RequestVote arguments\n", stderr);
+        return 1;
+    }
+    const raft_peer_config_t *peer = raft_config_peer_for_id(&config, (raft_node_id_t)peer_id);
+    if (peer == NULL) {
+        fputs("RequestVote peer not found in configuration\n", stderr);
+        return 1;
+    }
+    raft_vote_request_t req = {.term=term, .candidate_id=config.node_id,
+                               .last_log_index=last_index, .last_log_term=last_term};
+    uint8_t encoded[RAFT_VOTE_REQUEST_BYTES];
+    if (raft_vote_encode_request(&req, encoded) != RAFT_OK) {
+        fputs("Invalid RequestVote term or log metadata\n", stderr);
+        return 1;
+    }
+    char error[256];
+    int fd = raft_tcp_connect(peer, RAFT_TCP_CONNECT_TIMEOUT_MS, error, sizeof(error));
+    if (fd < 0) {
+        fprintf(stderr, "RequestVote connect failed: %s\n", error);
+        return 1;
+    }
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        perror("RequestVote socket timeout");
+        (void)close(fd);
+        return 1;
+    }
+    raft_wire_status_t status = raft_wire_send(fd, RAFT_WIRE_REQUEST_VOTE,
+                                  encoded, sizeof(encoded), error, sizeof(error));
+    uint8_t response_bytes[RAFT_VOTE_RESPONSE_BYTES];
+    raft_wire_type_t response_type;
+    size_t response_length = 0;
+    if (status == RAFT_WIRE_OK)
+        status = raft_wire_recv(fd, &response_type, response_bytes,
+                                sizeof(response_bytes), &response_length,
+                                error, sizeof(error));
+    (void)close(fd);
+    raft_vote_response_t response;
+    if (status != RAFT_WIRE_OK || response_type != RAFT_WIRE_REQUEST_VOTE_RESPONSE ||
+        raft_vote_decode_response(response_bytes, response_length, &response) != RAFT_OK) {
+        fprintf(stderr, "RequestVote failed: %s\n",
+                status == RAFT_WIRE_OK ? "invalid vote response" : error);
+        return 1;
+    }
+    printf("Vote response: local_node=%u peer=%u term=%llu granted=%d\n",
+           config.node_id, peer->id, (unsigned long long)response.term,
+           response.vote_granted);
+    puts("Phase 8: one-shot RPC only; no automatic elections or durable voting yet.");
+    return 0;
+}
+
 /* Logical-time example: no waiting, network traffic, voting, or role change. */
 static int timer_demo(const char *path)
 {
@@ -216,7 +296,8 @@ static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
           "--serve PATH [--max-connections N] | --probe PATH PEER_ID | "
-          "--ping PATH PEER_ID MESSAGE | --timer-demo PATH]\n", stderr);
+          "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
+          "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -252,6 +333,8 @@ int main(int argc, char **argv)
         return probe(argv[2], argv[3]);
     if (argc == 5 && strcmp(argv[1], "--ping") == 0)
         return ping_peer(argv[2], argv[3], argv[4]);
+    if (argc == 7 && strcmp(argv[1], "--request-vote") == 0)
+        return request_vote_peer(argv[2], argv[3], argv[4], argv[5], argv[6]);
     usage();
     return 1;
 }

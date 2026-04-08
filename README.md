@@ -3,13 +3,16 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 7 / 35 - Follower election timers.**
-The application exchanges bounded, binary-safe **PING/PONG** messages over
-real TCP sockets, now using a bounded pool of POSIX worker threads.
-**This is not yet Raft RPC, leader election, replicated
-consensus, an authenticated peer transport, or a working key-value store.**
+**Current milestone: Phase 8 / 35 - RequestVote RPC.**
+The application exchanges bounded, binary-safe **PING/PONG** and **RequestVote**
+messages over TCP using eight bounded worker threads. RequestVote follows
+term, one-vote-per-term, and log freshness rules **while the process is alive**.
+**This is not yet a complete Raft election:** there are no background
+candidate transitions, quorum counts, leader heartbeats, durable votes,
+replicated consensus, or authenticated peer identities. Never expose this
+educational transport to an untrusted network.
 
-## Implemented through Phase 7
+## Implemented through Phase 8
 
 - Raft term/node/index types, heap-owned in-memory log and node lifecycle.
 - Strict three-node IPv4 configuration parser with uniqueness checks.
@@ -23,6 +26,12 @@ consensus, an authenticated peer transport, or a working key-value store.**
 - Graceful worker cleanup on SIGINT/SIGTERM, including socket shutdown and joins.
 - Randomized, monotonic follower election deadlines (350-700 ms) with
   deterministic, clock-injected tests; no candidacy or vote RPCs yet.
+- RequestVote request/response encoding (28/9-byte big-endian payloads)
+  over framed TCP types 3/4; strict size and domain validation.
+- Follower vote decisions: terms, single vote per term, candidate log freshness,
+  and election-timeout reset only on grant; term updates even on stale-log denial.
+- Shared follower vote state protected by the TCP server mutex; non-member and
+  self-as-candidate IDs rejected at the transport boundary.
 - C unit tests and Python real-socket integration tests, including deliberately
   fragmented TCP writes, binary payloads, malformed/truncated frames,
   simultaneous clients, worker saturation, and signal-driven shutdown.
@@ -56,6 +65,40 @@ make
 
 `make test` runs Phase 1-7 suites. Loopback tests select temporary endpoints,
 so example ports 7001-7003 do not have to be free.
+
+
+## Phase 8: send one RequestVote request
+
+Terminal 1 (peer 1 as a listening follower):
+
+```sh
+./build/raft-engine --serve config/node1.conf
+```
+
+Terminal 2 (configured candidate 2 requesting a vote):
+
+```sh
+./build/raft-engine --request-vote config/node2.conf 1 1 0 0
+# Vote response: local_node=2 peer=1 term=1 granted=1
+./build/raft-engine --request-vote config/node3.conf 1 1 0 0
+# Vote response: local_node=3 peer=1 term=1 granted=0
+./build/raft-engine --request-vote config/node3.conf 1 2 0 0
+# Vote response: local_node=3 peer=1 term=2 granted=1
+```
+
+The arguments are LOCAL_CONFIG PEER_ID TERM LAST_INDEX LAST_TERM. The local
+node ID in the configuration is the candidate ID. The example ports are fixed,
+so stop any previous demo listening on port 7001 first. This demo does NOT
+start a campaign, gather a quorum or elect a leader; it sends one request.
+The in-memory vote is lost when the server restarts (durability comes later).
+
+To run only the new tests:
+
+```sh
+make build/test_raft_vote
+./build/test_raft_vote
+python3 tests/test_vote_integration.py ./build/raft-engine
+```
 
 ## Run the Phase 7 follower timer demonstration
 

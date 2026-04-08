@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Phase 5 educational wire format. Not yet a Raft RPC protocol.
+/* Length-prefixed transport shared by PING/PONG and RequestVote.
  * 12-byte header: magic:u32, version:u8, type:u8, reserved:u16, length:u32.
  * All multi-byte integers use network (big-endian) byte order.
  */
@@ -13,10 +13,12 @@
 #define RAFT_WIRE_VERSION 1u
 #define RAFT_WIRE_MAX_PAYLOAD 4096u
 
-/* Until Raft RPCs exist, the only wire messages are demo PING/PONG. */
+/* Frame types. All RequestVote payloads use raft_vote.h encoding. */
 typedef enum {
     RAFT_WIRE_PING = 1,
-    RAFT_WIRE_PONG = 2
+    RAFT_WIRE_PONG = 2,
+    RAFT_WIRE_REQUEST_VOTE = 3,
+    RAFT_WIRE_REQUEST_VOTE_RESPONSE = 4
 } raft_wire_type_t;
 
 typedef enum {
