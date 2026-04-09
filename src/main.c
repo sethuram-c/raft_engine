@@ -74,6 +74,66 @@ static int serve(const char *path, unsigned int max_connections)
     return 0;
 }
 
+static int elect_server(const char *path)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    char error[256];
+    if (raft_tcp_elect(&config, error, sizeof(error)) != 0) {
+        fprintf(stderr, "Election server failed: %s\n", error);
+        return 1;
+    }
+    return 0;
+}
+
+static int status_peer(const char *path, const char *peer_text)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    if (peer_text == NULL || *peer_text == '\0' || *peer_text == '-' || *peer_text == '+')
+        return 1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long id = strtoul(peer_text, &end, 10);
+    if (errno == ERANGE || end == peer_text || *end != '\0' || id == 0 ||
+        id > UINT32_MAX) return 1;
+    const raft_peer_config_t *peer = raft_config_peer_for_id(&config, (raft_node_id_t)id);
+    if (peer == NULL) return 1;
+    char error[256];
+    int fd = raft_tcp_connect(peer, RAFT_TCP_CONNECT_TIMEOUT_MS, error, sizeof(error));
+    if (fd < 0) { fprintf(stderr, "Status connection: %s\n", error); return 1; }
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        (void)close(fd); return 1;
+    }
+    raft_wire_status_t result = raft_wire_send(fd, RAFT_WIRE_STATUS_REQUEST,
+                                    NULL, 0, error, sizeof(error));
+    uint8_t data[17];
+    raft_wire_type_t type = RAFT_WIRE_PING;
+    size_t length = 0;
+    if (result == RAFT_WIRE_OK)
+        result = raft_wire_recv(fd, &type, data, sizeof(data), &length,
+                                error, sizeof(error));
+    (void)close(fd);
+    if (result != RAFT_WIRE_OK || type != RAFT_WIRE_STATUS_RESPONSE || length != 17 ||
+        data[12] > RAFT_LEADER) {
+        fprintf(stderr, "Status reply failed: %s\n", result == RAFT_WIRE_OK ? "invalid reply" : error);
+        return 1;
+    }
+    uint32_t response_id = 0, voted = 0;
+    uint64_t term = 0;
+    for (int i = 0; i < 4; ++i) {
+        response_id = (response_id << 8) | data[i];
+        voted = (voted << 8) | data[13+i];
+    }
+    for (int i = 0; i < 8; ++i) term = (term << 8) | data[4+i];
+    if (response_id != id) return 1;
+    printf("Status: node=%u role=%s term=%llu voted_for=%u\n", response_id,
+           raft_role_name((raft_role_t)data[12]), (unsigned long long)term, voted);
+    return 0;
+}
+
 static int probe(const char *path, const char *peer_id_text)
 {
     raft_cluster_config_t config;
@@ -295,7 +355,7 @@ static int timer_demo(const char *path)
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--serve PATH [--max-connections N] | --probe PATH PEER_ID | "
+          "--serve PATH [--max-connections N] | --elect PATH | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM]\n", stderr);
 }
@@ -315,6 +375,10 @@ int main(int argc, char **argv)
         return timer_demo(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--check-config") == 0)
         return check_config(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--elect") == 0)
+        return elect_server(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "--status") == 0)
+        return status_peer(argv[2], argv[3]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)
         return serve(argv[2], 0);
     if (argc == 5 && strcmp(argv[1], "--serve") == 0 &&

@@ -171,3 +171,23 @@ again in the same term. Peer identity is inferred from a self-declared ID,
 not authenticated; TCP is loopback demo transport. No candidate state machine,
 quorum calculation, leader selection or AppendEntries exists yet. Thus Phase
 8 is an RPC milestone, not a functioning consensus algorithm.
+
+
+## Phase 9: election-control plane
+
+In `--elect` mode an election thread shares a mutex-protected `raft_node_t`
+with the bounded TCP RPC worker pool. Its timed loop reads CLOCK_MONOTONIC,
+begins a candidacy when the node deadline expires, increments the current
+term, self-votes and snapshots current last-log metadata. It makes outbound
+RequestVote RPCs without holding the node mutex. Replies are applied under
+the mutex; distinct, current-term granted votes count toward quorum (2/3).
+A higher response term forces the node to follower and clears `voted_for`.
+
+`--status` uses a framed type-5 zero-byte request and a type-6, 17-byte
+response encoded in big-endian order: `node_id:u32 | term:u64 | role:u8 |
+voted_for:u32`. This is diagnostic metadata only. It is neither authorized nor
+linearizable and does not establish persistent cluster consensus.
+
+**Deliberate gap:** A leader does not send AppendEntries heartbeats in this
+phase. Other nodes may time out and start a new election. A returned leader
+role is therefore not proof of stable leadership or durable election safety.

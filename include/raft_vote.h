@@ -36,7 +36,7 @@ raft_status_t raft_vote_decode_response(const uint8_t *bytes, size_t length,
 /* Follower-side RequestVote logic (Raft 5.2 and 5.4.1). Caller serializes
  * concurrent access to node, and must have armed its follower timer.
  * This phase does not persist term/voted_for, so vote safety does not survive
- * restart. The next phases will add persistent state and real elections. */
+ * restart. Phase 9 adds automatic elections, but persistence comes later. */
 raft_status_t raft_vote_handle(raft_node_t *node,
                               const raft_vote_request_t *request,
                               uint64_t now_ms, raft_vote_response_t *response);

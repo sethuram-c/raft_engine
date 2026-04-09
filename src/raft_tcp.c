@@ -3,6 +3,7 @@
 #include "raft_tcp.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
+#include "raft_election.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -19,6 +20,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -193,6 +196,9 @@ struct tcp_server {
     raft_node_id_t node_id;
     raft_node_t vote_node; /* Protected by server->mutex. Memory-only Phase 8. */
     raft_cluster_config_t config; /* Fixed set of allowed candidate IDs. */
+    pthread_t election_thread;
+    bool election_thread_started;
+    atomic_bool election_stop;
 };
 
 static void process_client(int fd, tcp_server_t *server)
@@ -238,8 +244,27 @@ static void process_client(int fd, tcp_server_t *server)
                    (unsigned long long)rsp.term, rsp.vote_granted);
             (void)fflush(stdout);
         }
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_STATUS_REQUEST &&
+               length == 0) {
+        /* Read-only debug status: node_id:u32 term:u64 role:u8 voted_for:u32. */
+        uint8_t out[17];
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_node_id_t id = server->vote_node.id;
+        raft_term_t term = server->vote_node.current_term;
+        raft_role_t role = server->vote_node.role;
+        raft_node_id_t voted = server->vote_node.voted_for;
+        (void)pthread_mutex_unlock(&server->mutex);
+        for (int i = 0; i < 4; ++i) {
+            out[i] = (uint8_t)(id >> (24 - i * 8));
+            out[13 + i] = (uint8_t)(voted >> (24 - i * 8));
+        }
+        for (int i = 0; i < 8; ++i)
+            out[4 + i] = (uint8_t)(term >> (56 - i * 8));
+        out[12] = (uint8_t)role;
+        (void)raft_wire_send(fd, RAFT_WIRE_STATUS_RESPONSE,
+                             out, sizeof(out), message, sizeof(message));
     } else if (status == RAFT_WIRE_OK) {
-        fputs("Rejected frame: expected PING or RequestVote request\n", stderr);
+        fputs("Rejected frame: expected PING, RequestVote or empty STATUS request\n", stderr);
     }
     if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
         fprintf(stderr, "Rejected frame: %s\n", message);
@@ -270,6 +295,7 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
 {
     memset(server, 0, sizeof(*server));
     server->node_id = node_id;
+    atomic_init(&server->election_stop, false);
     int code = pthread_mutex_init(&server->mutex, NULL);
     if (code != 0) return code;
     code = pthread_cond_init(&server->worker_changed, NULL);
@@ -285,7 +311,7 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     uint64_t now_ms = 0;
     if (raft_clock_monotonic_ms(&now_ms) != RAFT_OK ||
         raft_node_start_follower(&server->vote_node, now_ms,
-                                 0x9E3779B9U ^ node_id) != RAFT_OK) {
+                                 0x9E3779B9U ^ node_id ^ (uint32_t)getpid() ^ (uint32_t)now_ms) != RAFT_OK) {
         raft_node_destroy(&server->vote_node);
         (void)pthread_cond_destroy(&server->worker_changed);
         (void)pthread_mutex_destroy(&server->mutex);
@@ -335,6 +361,9 @@ static void wait_for_worker(tcp_server_t *server)
 
 static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
 {
+    atomic_store(&server->election_stop, true);
+    if (server->election_thread_started)
+        (void)pthread_join(server->election_thread, NULL);
     if (interrupt) {
         (void)pthread_mutex_lock(&server->mutex);
         for (size_t i = 0; i < RAFT_TCP_MAX_WORKERS; ++i) {
@@ -355,9 +384,99 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
     (void)pthread_mutex_destroy(&server->mutex);
 }
 
-int raft_tcp_serve(const raft_cluster_config_t *config,
-                   unsigned int max_connections,
-                   char *error, size_t error_capacity)
+/* One outbound vote request. Socket I/O is deliberately OUTSIDE the
+ * node mutex so inbound peer voting continues during elections. */
+static int request_peer_vote(const raft_peer_config_t *peer,
+                             const raft_vote_request_t *req,
+                             raft_vote_response_t *response)
+{
+    char error[256];
+    int fd = raft_tcp_connect(peer, 250, error, sizeof(error));
+    if (fd < 0) return -1;
+    struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        (void)close(fd);
+        return -1;
+    }
+    uint8_t payload[RAFT_VOTE_REQUEST_BYTES];
+    if (raft_vote_encode_request(req, payload) != RAFT_OK) {
+        (void)close(fd);
+        return -1;
+    }
+    raft_wire_status_t result = raft_wire_send(fd, RAFT_WIRE_REQUEST_VOTE,
+                               payload, sizeof(payload), error, sizeof(error));
+    uint8_t reply[RAFT_VOTE_RESPONSE_BYTES];
+    raft_wire_type_t type = RAFT_WIRE_PING;
+    size_t length = 0;
+    if (result == RAFT_WIRE_OK)
+        result = raft_wire_recv(fd, &type, reply, sizeof(reply), &length,
+                                error, sizeof(error));
+    (void)close(fd);
+    return result == RAFT_WIRE_OK && type == RAFT_WIRE_REQUEST_VOTE_RESPONSE &&
+           raft_vote_decode_response(reply, length, response) == RAFT_OK ? 0 : -1;
+}
+
+static void *election_worker_main(void *argument)
+{
+    tcp_server_t *server = argument;
+    const struct timespec interval = {.tv_sec = 0, .tv_nsec = 20000000L};
+    while (!atomic_load(&server->election_stop) && !stop_requested) {
+        uint64_t now = 0;
+        if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
+        raft_election_round_t round;
+        raft_vote_request_t request;
+        bool begin = false;
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_node_t *node = &server->vote_node;
+        if (node->role != RAFT_LEADER &&
+            raft_election_timer_expired(&node->election_timer, now) &&
+            raft_election_begin(node, now, &round) == RAFT_OK) {
+            raft_index_t index = raft_log_last_index(&node->log);
+            raft_term_t log_term = 0;
+            (void)raft_log_term_at(&node->log, index, &log_term);
+            request = (raft_vote_request_t){node->current_term, node->id,
+                                            index, log_term};
+            begin = true;
+            printf("Election started: node=%u term=%llu self_votes=1\n",
+                   node->id, (unsigned long long)node->current_term);
+            (void)fflush(stdout);
+        }
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (begin) {
+            for (size_t i = 0; i < server->config.peer_count; ++i) {
+                if (atomic_load(&server->election_stop) || stop_requested) break;
+                const raft_peer_config_t *peer = &server->config.peers[i];
+                if (peer->id == server->node_id) continue;
+                raft_vote_response_t reply;
+                if (request_peer_vote(peer, &request, &reply) != 0) continue;
+                if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
+                (void)pthread_mutex_lock(&server->mutex);
+                raft_role_t previous = server->vote_node.role;
+                (void)raft_election_record(&server->vote_node, &round,
+                                            peer->id, &reply, now);
+                if (previous == RAFT_CANDIDATE &&
+                    server->vote_node.role == RAFT_LEADER) {
+                    printf("Leader elected: node=%u term=%llu votes=%u/3\n",
+                           server->node_id,
+                           (unsigned long long)server->vote_node.current_term,
+                           round.votes);
+                    (void)fflush(stdout);
+                }
+                bool continuing = server->vote_node.role == RAFT_CANDIDATE &&
+                                  server->vote_node.current_term == round.term;
+                (void)pthread_mutex_unlock(&server->mutex);
+                if (!continuing) break;
+            }
+        }
+        (void)nanosleep(&interval, NULL);
+    }
+    return NULL;
+}
+
+static int tcp_serve_mode(const raft_cluster_config_t *config,
+                          unsigned int max_connections, bool elections,
+                          char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
         return -1;
@@ -395,6 +514,19 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
         return -1;
     }
 
+    if (elections) {
+        code = pthread_create(&server.election_thread, NULL,
+                              election_worker_main, &server);
+        if (code != 0) {
+            report_error(error, error_capacity, "election worker: %s", strerror(code));
+            (void)close(listener);
+            stop_and_join_workers(&server, false);
+            (void)sigaction(SIGTERM, &previous_term, NULL);
+            (void)sigaction(SIGINT, &previous_int, NULL);
+            return -1;
+        }
+        server.election_thread_started = true;
+    }
     unsigned int accepted = 0;
     int result = 0;
     printf("Listening: node=%u %s:%u (max_connections=%u workers=%u)\n",
@@ -470,4 +602,17 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
         if (error != NULL && error_capacity != 0) error[0] = '\0';
     }
     return result;
+}
+
+int raft_tcp_serve(const raft_cluster_config_t *config,
+                   unsigned int max_connections,
+                   char *error, size_t error_capacity)
+{
+    return tcp_serve_mode(config, max_connections, false, error, error_capacity);
+}
+
+int raft_tcp_elect(const raft_cluster_config_t *config,
+                  char *error, size_t error_capacity)
+{
+    return tcp_serve_mode(config, 0, true, error, error_capacity);
 }

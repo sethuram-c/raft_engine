@@ -18,7 +18,9 @@ typedef enum {
     RAFT_WIRE_PING = 1,
     RAFT_WIRE_PONG = 2,
     RAFT_WIRE_REQUEST_VOTE = 3,
-    RAFT_WIRE_REQUEST_VOTE_RESPONSE = 4
+    RAFT_WIRE_REQUEST_VOTE_RESPONSE = 4,
+    RAFT_WIRE_STATUS_REQUEST = 5,
+    RAFT_WIRE_STATUS_RESPONSE = 6
 } raft_wire_type_t;
 
 typedef enum {

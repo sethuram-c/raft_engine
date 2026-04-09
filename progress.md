@@ -206,3 +206,26 @@ should succeed on Fedora Linux. Do not confuse a granted vote with a leader
 election: candidacy, self-voting, majority counting and heartbeats are later.
 Current term and votes are **not durable**; the server is not safe for real
 Raft elections after process restarts. Private learning PDF stays outside Git.
+
+## Phase 9 / 35 - Automatic leader election
+
+**Deliverable:** real candidate timeouts, self-votes, RequestVote RPC fanout,
+majority-backed leader transition, and read-only election status over TCP.
+
+- [x] Add testable `raft_election_begin` and `raft_election_record` APIs
+- [x] Count self-vote and only distinct peer replies in the current term
+- [x] Step down when responses contain a higher term
+- [x] Retry failed candidate elections after a randomized timeout
+- [x] Run election worker separately from bounded TCP request workers
+- [x] Preserve passive `--serve` behavior for previous-phase tests
+- [x] Introduce `--elect` and `--status` commands
+- [x] Test isolated node, two-node majority and joining third node
+- [x] Keep handbook PDF outside the source repository
+- [ ] Run on Fedora and commit after verifying locally
+
+**Known limits:** leader heartbeats, leader stability, durable votes, crash
+safety and log replication are not implemented in Phase 9. Status endpoints
+are debug-only and unauthenticated. One elected leader is a momentary fact,
+not a leadership lease or guaranteed stable leader.
+
+**Commit:** `feat: implement automatic raft leader elections over TCP`

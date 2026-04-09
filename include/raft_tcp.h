@@ -6,8 +6,7 @@
 #include <stddef.h>
 
 /*
- * Phase 6: a bounded number of POSIX worker threads respond to framed PINGs.
- * No Raft RPCs, authentication, or consensus yet.
+ * Bounded thread-per-connection TCP transport for PING and Raft voting.
  */
 #define RAFT_TCP_BACKLOG 16
 #define RAFT_TCP_CONNECT_TIMEOUT_MS 1000
@@ -32,10 +31,15 @@ int raft_tcp_connect(const raft_peer_config_t *peer, int timeout_ms,
  * max_connections=0 serves until SIGINT or SIGTERM; otherwise drains and
  * exits after N accepted connections. Signals interrupt active sockets.
  * Returns 0 on clean termination and -1 on fatal server errors.
- * This demo intentionally does NOT implement Raft messages yet.
+ * Phase 9 automatic voting is opt-in via raft_tcp_elect().
  */
 int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity);
+
+/* Run real, automatic RequestVote elections on three nodes. No heartbeats,
+ * durable terms/votes, or log replication yet. */
+int raft_tcp_elect(const raft_cluster_config_t *config,
+                  char *error, size_t error_capacity);
 
 #endif /* RAFT_TCP_H */

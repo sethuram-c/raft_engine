@@ -42,7 +42,9 @@ static int valid_type(raft_wire_type_t type)
 {
     return type == RAFT_WIRE_PING || type == RAFT_WIRE_PONG ||
            type == RAFT_WIRE_REQUEST_VOTE ||
-           type == RAFT_WIRE_REQUEST_VOTE_RESPONSE;
+           type == RAFT_WIRE_REQUEST_VOTE_RESPONSE ||
+           type == RAFT_WIRE_STATUS_REQUEST ||
+           type == RAFT_WIRE_STATUS_RESPONSE;
 }
 
 const char *raft_wire_status_name(raft_wire_status_t status)

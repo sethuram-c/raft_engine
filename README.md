@@ -231,3 +231,36 @@ stored in this repository. `.gitignore` excludes PDF and `learning-guides/`.
   threads; after N connections the server drains remaining workers.
 - On SIGINT/SIGTERM the main thread calls `shutdown()` on each active client
   while holding the mutex, joins them all, and restores its signal handlers.
+
+## Phase 9 - Automatic leader election (experimental)
+
+Run one process in each terminal (start all three for a full-cluster demo):
+
+```sh
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+```
+
+Query any node from another terminal:
+
+```sh
+./build/raft-engine --status config/node1.conf 1
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --status config/node1.conf 3
+```
+
+Expected format: `Status: node=1 role=leader term=1 voted_for=1`;
+node IDs, roles and terms depend on race timing. The new `--elect` mode runs
+randomized election timers, candidate transitions, self-voting, one-round
+RequestVote requests and majority counting. `--serve` remains the Phase 8
+passive RPC mode for backward-compatible tests.
+
+**Not yet stable or production safe:** no AppendEntries heartbeats (Phase 10),
+no durable term/vote state (later phase), no replicated log entries, and no
+peer authentication or access control. Nodes may repeatedly elect new leaders
+without heartbeats. `--status` is a debug-only unauthenticated RPC. A node
+running alone must never call itself leader in a three-node cluster.
+
+Run `make test` to exercise pure election transitions and the end-to-end
+one-node/no-quorum, two-node/quorum and three-node status checks.
