@@ -4,6 +4,7 @@
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_election.h"
+#include "raft_append.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -244,6 +245,29 @@ static void process_client(int fd, tcp_server_t *server)
                    (unsigned long long)rsp.term, rsp.vote_granted);
             (void)fflush(stdout);
         }
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_APPEND_ENTRIES) {
+        raft_append_request_t req;
+        raft_append_response_t rsp;
+        uint8_t output[RAFT_APPEND_RESPONSE_BYTES];
+        uint64_t now_ms = 0;
+        if (raft_append_decode_request(payload, length, &req) != RAFT_OK ||
+            raft_config_peer_for_id(&server->config, req.leader_id) == NULL ||
+            req.leader_id == server->node_id ||
+            raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
+            fputs("Rejected malformed or nonmember AppendEntries\n", stderr);
+            return;
+        }
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_status_t result = raft_append_handle(&server->vote_node, &req, now_ms, &rsp);
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (result != RAFT_OK ||
+            raft_append_encode_response(&rsp, output) != RAFT_OK) {
+            fputs("Could not process AppendEntries\n", stderr);
+            return;
+        }
+        status = raft_wire_send(fd, RAFT_WIRE_APPEND_ENTRIES_RESPONSE,
+                                output, sizeof(output), message, sizeof(message));
+        /* Heartbeat traffic is intentionally not logged on every request. */
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_STATUS_REQUEST &&
                length == 0) {
         /* Read-only debug status: node_id:u32 term:u64 role:u8 voted_for:u32. */
@@ -264,7 +288,7 @@ static void process_client(int fd, tcp_server_t *server)
         (void)raft_wire_send(fd, RAFT_WIRE_STATUS_RESPONSE,
                              out, sizeof(out), message, sizeof(message));
     } else if (status == RAFT_WIRE_OK) {
-        fputs("Rejected frame: expected PING, RequestVote or empty STATUS request\n", stderr);
+        fputs("Rejected frame: expected PING, RequestVote, AppendEntries or empty STATUS request\n", stderr);
     }
     if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
         fprintf(stderr, "Rejected frame: %s\n", message);
@@ -417,16 +441,57 @@ static int request_peer_vote(const raft_peer_config_t *peer,
            raft_vote_decode_response(reply, length, response) == RAFT_OK ? 0 : -1;
 }
 
+
+/* Heartbeats are empty AppendEntries RPCs in Phase 10.  No socket I/O
+ * takes place while holding the shared Raft node mutex. */
+#define RAFT_HEARTBEAT_INTERVAL_MS 90u
+#define RAFT_HEARTBEAT_CONNECT_MS 80
+#define RAFT_HEARTBEAT_IO_TIMEOUT_US 95000
+
+static int send_peer_heartbeat(const raft_peer_config_t *peer,
+                               const raft_append_request_t *request,
+                               raft_append_response_t *response)
+{
+    char error[256];
+    int fd = raft_tcp_connect(peer, RAFT_HEARTBEAT_CONNECT_MS, error, sizeof(error));
+    if (fd < 0) return -1;
+    struct timeval timeout = {.tv_sec = 0, .tv_usec = RAFT_HEARTBEAT_IO_TIMEOUT_US};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        (void)close(fd);
+        return -1;
+    }
+    uint8_t payload[RAFT_APPEND_REQUEST_BYTES];
+    if (raft_append_encode_request(request, payload) != RAFT_OK) {
+        (void)close(fd);
+        return -1;
+    }
+    raft_wire_status_t result = raft_wire_send(fd, RAFT_WIRE_APPEND_ENTRIES,
+                               payload, sizeof(payload), error, sizeof(error));
+    uint8_t reply[RAFT_APPEND_RESPONSE_BYTES];
+    raft_wire_type_t type = RAFT_WIRE_PING;
+    size_t length = 0;
+    if (result == RAFT_WIRE_OK)
+        result = raft_wire_recv(fd, &type, reply, sizeof(reply), &length,
+                                error, sizeof(error));
+    (void)close(fd);
+    return result == RAFT_WIRE_OK && type == RAFT_WIRE_APPEND_ENTRIES_RESPONSE &&
+           raft_append_decode_response(reply, length, response) == RAFT_OK ? 0 : -1;
+}
+
 static void *election_worker_main(void *argument)
 {
     tcp_server_t *server = argument;
     const struct timespec interval = {.tv_sec = 0, .tv_nsec = 20000000L};
+    uint64_t next_heartbeat_ms = 0;
     while (!atomic_load(&server->election_stop) && !stop_requested) {
         uint64_t now = 0;
         if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
         raft_election_round_t round;
         raft_vote_request_t request;
         bool begin = false;
+        bool heartbeat = false;
+        raft_append_request_t heartbeat_request = {0};
         (void)pthread_mutex_lock(&server->mutex);
         raft_node_t *node = &server->vote_node;
         if (node->role != RAFT_LEADER &&
@@ -442,7 +507,39 @@ static void *election_worker_main(void *argument)
                    node->id, (unsigned long long)node->current_term);
             (void)fflush(stdout);
         }
+        if (node->role == RAFT_LEADER && now >= next_heartbeat_ms) {
+            raft_index_t last_index = raft_log_last_index(&node->log);
+            raft_term_t last_term = 0;
+            (void)raft_log_term_at(&node->log, last_index, &last_term);
+            heartbeat_request = (raft_append_request_t){
+                node->current_term, node->id, last_index, last_term, node->commit_index
+            };
+            heartbeat = true;
+            next_heartbeat_ms = now + RAFT_HEARTBEAT_INTERVAL_MS;
+        }
         (void)pthread_mutex_unlock(&server->mutex);
+        if (heartbeat) {
+            for (size_t i = 0; i < server->config.peer_count; ++i) {
+                if (atomic_load(&server->election_stop) || stop_requested) break;
+                const raft_peer_config_t *peer = &server->config.peers[i];
+                if (peer->id == server->node_id) continue;
+                raft_append_response_t reply;
+                if (send_peer_heartbeat(peer, &heartbeat_request, &reply) != 0) continue;
+                if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
+                (void)pthread_mutex_lock(&server->mutex);
+                raft_role_t old = server->vote_node.role;
+                (void)raft_append_handle_response(&server->vote_node, &reply, now);
+                bool still_leader = server->vote_node.role == RAFT_LEADER &&
+                    server->vote_node.current_term == heartbeat_request.term;
+                if (old == RAFT_LEADER && !still_leader) {
+                    printf("Leader stepped down: node=%u term=%llu\n", server->node_id,
+                           (unsigned long long)server->vote_node.current_term);
+                    (void)fflush(stdout);
+                }
+                (void)pthread_mutex_unlock(&server->mutex);
+                if (!still_leader) break;
+            }
+        }
         if (begin) {
             for (size_t i = 0; i < server->config.peer_count; ++i) {
                 if (atomic_load(&server->election_stop) || stop_requested) break;
@@ -462,6 +559,7 @@ static void *election_worker_main(void *argument)
                            (unsigned long long)server->vote_node.current_term,
                            round.votes);
                     (void)fflush(stdout);
+                    next_heartbeat_ms = 0; /* send first heartbeat next loop */
                 }
                 bool continuing = server->vote_node.role == RAFT_CANDIDATE &&
                                   server->vote_node.current_term == round.term;
@@ -566,13 +664,18 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             break;
         }
         ++accepted;
-        char address_text[INET_ADDRSTRLEN] = "<unknown>";
-        (void)inet_ntop(AF_INET, &remote.sin_addr,
-                        address_text, sizeof(address_text));
-        printf("Accepted: node=%u connection=%u from=%s:%u\n",
-               config->node_id, accepted, address_text,
-               (unsigned)ntohs(remote.sin_port));
-        (void)fflush(stdout);
+        /* Preserve detailed connection logging for passive --serve demos.
+         * Heartbeats create many short-lived connections in --elect mode;
+         * logging each accepted socket would flood stdout and skew timing. */
+        if (!elections) {
+            char address_text[INET_ADDRSTRLEN] = "<unknown>";
+            (void)inet_ntop(AF_INET, &remote.sin_addr,
+                            address_text, sizeof(address_text));
+            printf("Accepted: node=%u connection=%u from=%s:%u\n",
+                   config->node_id, accepted, address_text,
+                   (unsigned)ntohs(remote.sin_port));
+            (void)fflush(stdout);
+        }
 
         tcp_worker_t *worker = free_worker_slot(&server);
         /* free_worker_slot() is valid: only the accept thread sets in_use. */

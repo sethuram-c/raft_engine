@@ -191,3 +191,40 @@ linearizable and does not establish persistent cluster consensus.
 **Deliberate gap:** A leader does not send AppendEntries heartbeats in this
 phase. Other nodes may time out and start a new election. A returned leader
 role is therefore not proof of stable leadership or durable election safety.
+
+
+## Phase 10: zero-entry AppendEntries heartbeat protocol
+
+Transport frame types **7** (AppendEntries) and **8** (response) extend the
+Phase 5 12-byte RAFT outer header. Phase 10 requests are fixed 36 bytes:
+`term:u64 | leader_id:u32 | prev_log_index:u64 | prev_log_term:u64 |
+leader_commit:u64`; replies are fixed 9 bytes: `term:u64 | success:u8`.
+All multi-byte fields are explicitly big-endian. This phase sends *no log
+entries*. The same AppendEntries RPC will carry log entries in later phases.
+
+In `--elect` mode, the election thread handles both candidacy and heartbeats.
+After a successful majority vote, the newly elected leader sends its first
+heartbeat on the next election-loop iteration and thereafter approximately
+every 90ms. Sending is performed without holding the Raft state mutex. Each
+client worker validates the leader ID against fixed membership before handling
+the request. The state mutex guards follower term transitions, timer resets,
+and responses. A higher-term heartbeat response causes immediate step-down.
+
+Correct receiving rules for this zero-entry subset:
+
+1. Reject a malformed request or nonmember before touching Raft state.
+2. Lower-term requests receive `success=0` with the local term; timer unchanged.
+3. For an equal/higher term, recognize the leader (become follower), reset the
+   randomized election deadline and clear `voted_for` only on higher terms.
+4. Compare the prev log index/term. A mismatch returns `success=0`, but *still*
+   resets the election deadline because leader contact is valid.
+5. With a matching prefix, a zero-entry heartbeat may move commitIndex up to
+   `min(leaderCommit, prevLogIndex)`. It cannot invent missing entries.
+6. The leader receiving a higher-term response reverts to follower and resets
+   its timeout. Equality or stale replies do not force a transition.
+
+The integration test uses three independent Linux processes, real temporary
+loopback TCP ports, stability sampling, a stopped leader and a restarted node.
+No persistent state, log conflict repair, authentication or quorum-loss
+step-down is implemented at this milestone. Status sampling does **not** prove
+linearizability or a network-wide leader lease.

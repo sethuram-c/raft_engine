@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Length-prefixed transport shared by PING/PONG and RequestVote.
+/* Length-prefixed transport shared by PING/PONG, RequestVote and AppendEntries.
  * 12-byte header: magic:u32, version:u8, type:u8, reserved:u16, length:u32.
  * All multi-byte integers use network (big-endian) byte order.
  */
@@ -20,7 +20,9 @@ typedef enum {
     RAFT_WIRE_REQUEST_VOTE = 3,
     RAFT_WIRE_REQUEST_VOTE_RESPONSE = 4,
     RAFT_WIRE_STATUS_REQUEST = 5,
-    RAFT_WIRE_STATUS_RESPONSE = 6
+    RAFT_WIRE_STATUS_RESPONSE = 6,
+    RAFT_WIRE_APPEND_ENTRIES = 7,
+    RAFT_WIRE_APPEND_ENTRIES_RESPONSE = 8
 } raft_wire_type_t;
 
 typedef enum {

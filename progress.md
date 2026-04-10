@@ -229,3 +229,31 @@ are debug-only and unauthenticated. One elected leader is a momentary fact,
 not a leadership lease or guaranteed stable leader.
 
 **Commit:** `feat: implement automatic raft leader elections over TCP`
+
+
+## Phase 10 / 35 - AppendEntries heartbeats and stable election
+
+**Time budget:** ~2 hours. **Planned:** January 10, 2027.
+
+**Deliverable:** three C processes automatically elect and maintain a single
+leader under healthy localhost communication using empty AppendEntries RPCs.
+
+- [x] Define a 36-byte AppendEntries (empty heartbeat) request and 9-byte reply
+- [x] Add frame types 7 and 8 to the bounded RAFT wire protocol
+- [x] Reject malformed and nonmember leader IDs before changing term or timer
+- [x] Ignore stale terms without resetting the election timeout
+- [x] On current/higher term, recognize the leader and reset election deadline
+- [x] Reply to previous-log mismatch while still honoring valid leader contact
+- [x] Step down on higher-term heartbeat responses
+- [x] Send heartbeats without holding the mutex during socket I/O
+- [x] Keep 350-700ms follower election timers and add ~90ms heartbeat interval
+- [x] Test stable 3-node leadership, leader failure, 2-node reelection, and rejoin
+- [x] Preserve all prior tests and run sanitizer checks
+- [ ] Run on personal Fedora workstation, inspect code, and commit with actual time
+
+**Verify:** `make clean && make && make test`, then run three `--elect` nodes
+and query each with `--status`. `tests/test_heartbeat_integration.py` uses
+nonfixed localhost ports. Phase 10 does not yet replicate log entries,
+write durable votes or prove crash safety.
+
+**Commit:** `feat: add AppendEntries heartbeats for stable raft leadership`

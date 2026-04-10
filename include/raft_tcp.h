@@ -37,8 +37,8 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity);
 
-/* Run real, automatic RequestVote elections on three nodes. No heartbeats,
- * durable terms/votes, or log replication yet. */
+/* Run automatic RequestVote elections plus periodic empty AppendEntries
+ * heartbeats. Terms/votes are not durable; log replication comes later. */
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity);
 

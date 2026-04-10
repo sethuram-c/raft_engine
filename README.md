@@ -3,14 +3,13 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 8 / 35 - RequestVote RPC.**
-The application exchanges bounded, binary-safe **PING/PONG** and **RequestVote**
-messages over TCP using eight bounded worker threads. RequestVote follows
-term, one-vote-per-term, and log freshness rules **while the process is alive**.
-**This is not yet a complete Raft election:** there are no background
-candidate transitions, quorum counts, leader heartbeats, durable votes,
-replicated consensus, or authenticated peer identities. Never expose this
-educational transport to an untrusted network.
+**Current milestone: Phase 10 / 35 - Leader heartbeats and election stability.**
+A fixed three-node cluster can now elect a leader, periodically exchange
+zero-entry AppendEntries heartbeats, reset followers' election timers and
+reelect another leader after a failure. This is a **learning implementation**:
+term/vote state remains in memory, AppendEntries carries no log entries, and
+there is no durability, authentication, quorum-loss detection or production
+leader-lease guarantee. Bind test nodes only to trusted loopback addresses.
 
 ## Implemented through Phase 8
 
@@ -264,3 +263,48 @@ running alone must never call itself leader in a three-node cluster.
 
 Run `make test` to exercise pure election transitions and the end-to-end
 one-node/no-quorum, two-node/quorum and three-node status checks.
+
+## Phase 10: stable leadership with AppendEntries heartbeats
+
+Build and verify the complete project:
+
+```sh
+make clean && make && make test
+./build/test_raft_append
+python3 tests/test_heartbeat_integration.py ./build/raft-engine
+```
+
+Start three nodes in separate terminals:
+
+```sh
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+```
+
+In a fourth terminal, inspect local states several times:
+
+```sh
+for i in 1 2 3; do ./build/raft-engine --status config/node1.conf "$i"; done
+sleep 2
+for i in 1 2 3; do ./build/raft-engine --status config/node1.conf "$i"; done
+```
+
+Under normal localhost conditions the same leader and term should appear
+across successive samples. Heartbeats are empty AppendEntries RPC type 7
+(36-byte payload), answered with type 8 (9-byte payload). Leaders send every
+~90 ms. Recipients recognize a configured peer and reject stale terms; valid
+leader contact resets election timeouts even when the previous-log consistency
+check fails. The network integration test also kills the leader, verifies a
+new leader with two survivors, then restarts the stopped process.
+
+**Limitations:** There is no log-entry replication, crash-safe term/vote storage,
+or state-machine application yet. The heartbeat sender currently polls peers
+sequentially and uses short socket timeouts. Lack of reachable quorum does
+not automatically demote a leader (Raft's basic model does not require that).
+The wire protocol identifies senders only by fields in payloads; without
+peer authentication, an untrusted client could impersonate a configured
+node. Do not expose the educational server on the public network.
+
+The private Phase 10 learning handbook is intentionally not included in the
+repository; `.gitignore` excludes `*.pdf` and `learning-guides/`.
