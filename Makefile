@@ -17,6 +17,7 @@ TEST_TIMER = build/test_raft_timer
 TEST_VOTE = build/test_raft_vote
 TEST_ELECTION = build/test_raft_election
 TEST_APPEND = build/test_raft_append
+TEST_RECONCILE = build/test_raft_reconcile
 
 .PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
@@ -48,6 +49,9 @@ $(TEST_ELECTION): tests/test_raft_election.c src/raft_election.c src/raft_vote.c
 $(TEST_APPEND): tests/test_raft_append.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_append.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
 
+$(TEST_RECONCILE): tests/test_raft_reconcile.c src/raft_log.c src/raft_node.c src/raft_timer.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_reconcile.c src/raft_log.c src/raft_node.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
+
 build:
 	mkdir -p build
 
@@ -57,6 +61,7 @@ run: $(APP)
 demo: $(APP)
 	./$(APP) --demo
 	./$(APP) --timer-demo config/node1.conf
+	./$(APP) --log-demo
 
 check-config: $(APP)
 	./$(APP) --check-config config/node1.conf
@@ -66,7 +71,7 @@ check-config: $(APP)
 test-smoke: $(APP)
 	sh tests/test_smoke.sh ./$(APP)
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND)
+test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE)
 	./$(TEST_LOG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
@@ -75,6 +80,7 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_VOTE)
 	./$(TEST_ELECTION)
 	./$(TEST_APPEND)
+	./$(TEST_RECONCILE)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -87,6 +93,7 @@ test-network: $(APP)
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)
 	sh tests/test_timer_cli.sh ./$(APP)
+	sh tests/test_log_demo.sh ./$(APP)
 	$(MAKE) test-network
 
 clean:

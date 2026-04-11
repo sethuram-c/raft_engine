@@ -257,3 +257,32 @@ nonfixed localhost ports. Phase 10 does not yet replicate log entries,
 write durable votes or prove crash safety.
 
 **Commit:** `feat: add AppendEntries heartbeats for stable raft leadership`
+
+
+## Phase 11 / 35 - In-memory Raft log matching and conflict repair
+
+**Time budget:** ~2 hours. **Planned date:** January 11, 2027.
+
+**Deliverable:** a safe, unit-tested in-memory log reconciliation API that
+preserves matching prefixes, rejects previous-log mismatches and committed
+entry overwrites, deep-copies new commands and does not truncate on heartbeat.
+
+- [x] Implement `raft_log_matches` for the `(index, term)` check
+- [x] Implement `raft_log_last_term` with virtual `(0,0)` prefix
+- [x] Add `raft_log_reconcile` with nondecreasing-term validation
+- [x] Reject conflicts within committed entries
+- [x] Validate allocation/count overflow and perform failure-atomic repair
+- [x] Add Phase 11 tests and `--log-demo` CLI
+- [x] Preserve Phase 1-10 behavior in the normal test suite
+- [ ] Run and verify on personal Fedora workstation
+- [ ] Commit reviewed source using actual completion timestamp
+
+**Verify:** `make clean && make && make test && make demo` and
+`./build/test_raft_reconcile`.
+
+**Limitations:** no on-wire entries, network log replication, majority
+commit tracking, persistence or state machine in this phase. Future network
+handlers must hold the node mutex and check leader term before calling
+`raft_log_reconcile`. The private learning PDF is outside the repository.
+
+**Commit:** `feat: add conflict-safe in-memory raft log reconciliation`

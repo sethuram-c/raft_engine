@@ -35,6 +35,42 @@ static int demo(void)
     return 0;
 }
 
+/* Phase 11: demonstrate memory-only suffix repair without network traffic. */
+static int log_demo(void)
+{
+    raft_log_t log;
+    raft_log_init(&log);
+    if (raft_log_append(&log, 1, "SET x 1", 7) != RAFT_OK ||
+        raft_log_append(&log, 2, "SET y old", 9) != RAFT_OK ||
+        raft_log_append(&log, 2, "SET z old", 9) != RAFT_OK) {
+        raft_log_destroy(&log);
+        return 1;
+    }
+    raft_log_entry_t leader_entries[] = {
+        {3, (uint8_t *)"SET y 2", 7},
+        {3, (uint8_t *)"SET z 3", 7}
+    };
+    raft_index_t match = 0;
+    raft_status_t result = raft_log_reconcile(&log, 1, 1,
+                                             leader_entries, 2, 1, &match);
+    if (result != RAFT_OK) {
+        raft_log_destroy(&log);
+        return 1;
+    }
+    printf("Log repair: matched_through=%llu total_entries=%zu\n",
+           (unsigned long long)match, log.count);
+    for (raft_index_t i = 1; i <= raft_log_last_index(&log); ++i) {
+        const raft_log_entry_t *entry = raft_log_at(&log, i);
+        printf("entry[%llu]: term=%llu command=", (unsigned long long)i,
+               (unsigned long long)entry->term);
+        (void)fwrite(entry->command, 1, entry->command_len, stdout);
+        putchar('\n');
+    }
+    puts("In-memory demonstration only: no TCP log replication or disk writes.");
+    raft_log_destroy(&log);
+    return 0;
+}
+
 static int load_config(const char *path, raft_cluster_config_t *config)
 {
     char error[256];
@@ -355,7 +391,7 @@ static int timer_demo(const char *path)
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--serve PATH [--max-connections N] | --elect PATH | --status PATH PEER_ID | --probe PATH PEER_ID | "
+          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM]\n", stderr);
 }
@@ -371,6 +407,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--demo") == 0) return demo();
+    if (argc == 2 && strcmp(argv[1], "--log-demo") == 0) return log_demo();
     if (argc == 3 && strcmp(argv[1], "--timer-demo") == 0)
         return timer_demo(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--check-config") == 0)

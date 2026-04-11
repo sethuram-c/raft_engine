@@ -3,11 +3,13 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 10 / 35 - Leader heartbeats and election stability.**
-A fixed three-node cluster can now elect a leader, periodically exchange
+**Current milestone: Phase 11 / 35 - In-memory log matching and suffix reconciliation.**
+A fixed three-node cluster can elect a leader, periodically exchange
 zero-entry AppendEntries heartbeats, reset followers' election timers and
-reelect another leader after a failure. This is a **learning implementation**:
-term/vote state remains in memory, AppendEntries carries no log entries, and
+reelect another leader after a failure. Phase 11 adds an independently
+tested **in-memory** log consistency and conflict-repair library (not yet wired
+into the network RPC). This is a **learning implementation**:
+term/vote state remains in memory, network AppendEntries carries no log entries, and
 there is no durability, authentication, quorum-loss detection or production
 leader-lease guarantee. Bind test nodes only to trusted loopback addresses.
 
@@ -308,3 +310,54 @@ node. Do not expose the educational server on the public network.
 
 The private Phase 10 learning handbook is intentionally not included in the
 repository; `.gitignore` excludes `*.pdf` and `learning-guides/`.
+
+## Phase 11: follower log consistency and suffix repair (memory only)
+
+This milestone adds `raft_log_matches`, `raft_log_last_term`, and
+`raft_log_reconcile` to `include/raft_log.h`, alongside earlier append,
+term lookup and truncation. `raft_log_reconcile` is the in-memory primitive
+for Phase 12's future entry-carrying AppendEntries messages.
+
+- A `(prev_log_index, prev_log_term)` pair must match before any changes.
+- Index zero represents the virtual pre-log entry `(0,0)`.
+- Entries that match by index and term are **not** duplicated or replaced.
+- The first mismatching entry causes a replacement of the uncommitted suffix.
+- Entries at or below the passed `committed_index` cannot be overwritten.
+- Empty and fully matching batches do **not** erase an existing local tail.
+- Input is checked and new payloads are deep-copied *before* the old
+  log is changed. A validation/allocation failure leaves the log unchanged.
+- These functions are **not thread-safe**; the future RPC handler must hold
+  the node mutex, check term/membership, and durably persist accepted entries.
+
+Build, run the demonstration, and test:
+
+```sh
+make clean && make
+./build/raft-engine --log-demo
+./build/test_raft_reconcile
+sh tests/test_log_demo.sh ./build/raft-engine
+make test
+```
+
+Expected demonstration summary:
+
+```text
+Log repair: matched_through=3 total_entries=3
+entry[1]: term=1 command=SET x 1
+entry[2]: term=3 command=SET y 2
+entry[3]: term=3 command=SET z 3
+In-memory demonstration only: no TCP log replication or disk writes.
+```
+
+To debug: `gdb --args ./build/raft-engine --log-demo` then use
+`break raft_log_reconcile`, `run`, and `next`. For memory checks build with
+`-fsanitize=address,undefined` as in the earlier Make/diagnostics section.
+
+**Phase boundary:** The network's 36-byte AppendEntries request is still
+heartbeat-only; no C cluster command replication, state machine application,
+commit-majority logic, storage persistence or crash recovery exists yet.
+Matching by `(index, term)` relies on Raft's leader append-only invariant:
+correct leaders do not produce different commands at the same index and term.
+
+**Repository hygiene:** Learning PDFs are delivered separately; `.gitignore`
+excludes `*.pdf` and `learning-guides/`.

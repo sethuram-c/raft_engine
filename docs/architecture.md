@@ -228,3 +228,42 @@ loopback TCP ports, stability sampling, a stopped leader and a restarted node.
 No persistent state, log conflict repair, authentication or quorum-loss
 step-down is implemented at this milestone. Status sampling does **not** prove
 linearizability or a network-wide leader lease.
+
+
+## Phase 11 - Raft log reconciliation API (not yet on the wire)
+
+The in-memory `raft_log_t` owns a dynamic array of `raft_log_entry_t` structs,
+whose `command` buffers are independently heap-allocated. Log indices are
+**1-based**; `(index=0, term=0)` is the virtual prefix. An empty log has
+`last_index=0`, and `raft_log_last_term` returns zero.
+
+`raft_log_reconcile(log, prev_index, prev_term, incoming, count,
+committed_index, &matched)` performs the in-memory equivalent of the log
+consistency and append portions of the AppendEntries follower algorithm:
+
+1. Validate parameters and the entire proposed entry batch. Terms must be
+   nonzero and nondecreasing; command pointers must be present for nonempty
+   payloads; indices and allocation lengths cannot overflow.
+2. Reject a missing or mismatched previous entry before changing anything.
+3. Compare proposed entries with local entries by `(index, term)` and skip
+   matching ones; a matching batch never truncates a local tail.
+4. If the first conflict would overwrite an index <= `committed_index`, reject.
+5. Allocate a new entry array, copy preserved ownership references, deep-copy
+   replacement payloads, then atomically swap ownership into the log. If any
+   allocation fails, free temporary copies, leave the old log intact.
+6. Report the leader-proven last matching index as `prev_index + count`.
+
+This API is **not synchronized internally**: when wired to AppendEntries in
+Phase 12, the caller must hold the Raft mutex and validate sender membership,
+terms, entry bounds and node state, then arrange durable writes before
+acknowledging success. The current network AppendEntries request still carries
+zero entries and is unchanged in Phase 11. `committed_index` is a protection
+floor supplied by the caller; the function does **not** advance commitIndex.
+
+Correct Raft leaders ensure identical commands for the same log index/term.
+Because log matching relies on this invariant, this API compares overlapping
+entries by term, not by bytewise command equality. Arbitrary hostile leaders
+or disk corruption are outside this educational protocol's safety guarantees.
+
+New files/tests: `tests/test_raft_reconcile.c`, `tests/test_log_demo.sh`.
+Manual in-memory sample: `./build/raft-engine --log-demo`.

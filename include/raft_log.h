@@ -2,11 +2,9 @@
 #define RAFT_LOG_H
 
 #include "raft_types.h"
-
 #include <stddef.h>
 #include <stdint.h>
 
-/* An entry owns its command buffer. Its index is its 1-based position. */
 typedef struct {
     raft_term_t term;
     uint8_t *command;
@@ -19,25 +17,41 @@ typedef struct {
     size_t capacity;
 } raft_log_t;
 
-/* Initialize exactly once before use. Destroy when finished. */
 void raft_log_init(raft_log_t *log);
 void raft_log_destroy(raft_log_t *log);
-
-/* Copy the command into owned memory. Zero-length commands are allowed. */
 raft_status_t raft_log_append(raft_log_t *log, raft_term_t term,
                               const void *command, size_t command_len);
-
-/* Index 0 is reserved; the first real entry is at index 1. */
 raft_index_t raft_log_last_index(const raft_log_t *log);
-const raft_log_entry_t *raft_log_at(const raft_log_t *log,
-                                    raft_index_t index);
-
-/* The virtual entry at index 0 has term 0. Other missing indices fail. */
+const raft_log_entry_t *raft_log_at(const raft_log_t *log, raft_index_t index);
 raft_status_t raft_log_term_at(const raft_log_t *log, raft_index_t index,
                                 raft_term_t *out_term);
+raft_status_t raft_log_truncate_from(raft_log_t *log, raft_index_t first_index);
 
-/* Discard indices >= first_index; first_index == last_index+1 is a no-op. */
-raft_status_t raft_log_truncate_from(raft_log_t *log,
-                                     raft_index_t first_index);
+/* Raft logical index 0 is a virtual entry with term 0. */
+int raft_log_matches(const raft_log_t *log, raft_index_t index,
+                     raft_term_t term);
+raft_status_t raft_log_last_term(const raft_log_t *log, raft_term_t *out_term);
 
-#endif /* RAFT_LOG_H */
+/* Reconcile a follower's in-memory log with a single AppendEntries batch.
+ * Incoming entries are indexed prev_index+1 ... prev_index+entry_count.
+ * - Reject a missing/mismatched (prev_index, prev_term).
+ * - Preserve matching prefix entries (index+term), even with duplicates.
+ * - Replace the first conflicting suffix; never truncate on an empty or
+ *   wholly matching batch, even when local log has extra entries.
+ * - Reject modification of entries at/below committed_index.
+ * - Validate/copy everything BEFORE mutating log (failure atomicity).
+ * - On success, out_last_matched is prev_index + entry_count.
+ *
+ * Caller owns incoming command buffers; success copies them as needed.
+ * Caller MUST serialize access to log and committed_index externally.
+ * This is an in-memory preparation API: no TCP or persistence in Phase 11.
+ */
+raft_status_t raft_log_reconcile(raft_log_t *log,
+                                 raft_index_t prev_index,
+                                 raft_term_t prev_term,
+                                 const raft_log_entry_t *entries,
+                                 size_t entry_count,
+                                 raft_index_t committed_index,
+                                 raft_index_t *out_last_matched);
+
+#endif
