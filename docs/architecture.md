@@ -1,6 +1,7 @@
-# Raft Engine Architecture - Through Phase 5
+# Raft Engine Architecture - Through Phase 12
 
-This document distinguishes what exists now from future Raft consensus.
+Historical sections below describe the earlier milestones; the current
+Phase 12 architecture and protocol are summarized at the end.
 
 ## Modules
 
@@ -267,3 +268,62 @@ or disk corruption are outside this educational protocol's safety guarantees.
 
 New files/tests: `tests/test_raft_reconcile.c`, `tests/test_log_demo.sh`.
 Manual in-memory sample: `./build/raft-engine --log-demo`.
+
+
+## Current architecture: Phase 12 log replication
+
+```text
+  CLI --append-demo (configured node 1, diagnostic probe)
+        |
+        | raft_append_encode_batch()
+        v
+  framed TCP (12-byte RAFT header, type=7)
+        |
+        v
+  server worker on configured follower node 2
+        |
+        +-- verify wire framing + fixed cluster membership
+        +-- raft_append_decode_batch() (command slices borrow socket buffer)
+        +-- pthread mutex (node state and log serialization)
+        |      |
+        |      +-- stale/higher term rules and follower timeout reset
+        |      +-- raft_log_reconcile() (deep-copy, atomic suffix replace)
+        |      +-- commit_index = min(leader_commit, last_new_index)
+        |
+        +-- response: type=8, term:u64 + success:u8
+        v
+  diagnostic CLI displays result; --log-status reports metadata
+```
+
+- `src/raft_append.c`: validates, encodes, decodes and handles bounded entry
+  batches; empty 36-byte heartbeats are backwards compatible.
+- `src/raft_log.c`: owns all stored command bytes; incoming decoder borrows
+  command slices only until reconciliation finishes.
+- `src/raft_tcp.c`: validates cluster membership before locking the node,
+  releases the mutex before sending the reply, and guards log state with
+  the same mutex that protects election and voting state.
+- `src/raft_replicate_client.c`: developer-only one-shot AppendEntries probe
+  and read-only log-index status request (frame types 9/10).
+
+### Phase 12 variable-length AppendEntries payload
+
+```text
+term:u64 | leader_id:u32 | prev_index:u64 | prev_term:u64 | leader_commit:u64
+[ if entry-bearing: count:u16 | (term:u64 | len:u16 | command:len bytes)* ]
+```
+
+All integers are network-order. Total payload <= 4096 bytes; count <=16.
+No C structs, pointers or native padding are transmitted. A 36-byte payload
+means zero entries. 37-byte and malformed entry-bearing payloads are rejected.
+
+Important distinctions:
+
+- `success=1` means this follower matched the prefix and appended/reused the
+  entries; it is NOT a quorum commit acknowledgement.
+- `leader_commit` is an input from a trusted leader, not inferred from a
+  single follower reply. The demo leaves it at zero.
+- Automatic leader-side replication progress and retries are **not yet**
+  implemented. Existing `--elect` heartbeats remain empty RPCs.
+- State is not persisted and RPC senders are not authenticated. Bind to
+  loopback addresses and never deploy in an untrusted network.
+- The log status endpoint reports index/term/commit, not complete commands.

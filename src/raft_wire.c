@@ -46,7 +46,9 @@ static int valid_type(raft_wire_type_t type)
            type == RAFT_WIRE_STATUS_REQUEST ||
            type == RAFT_WIRE_STATUS_RESPONSE ||
            type == RAFT_WIRE_APPEND_ENTRIES ||
-           type == RAFT_WIRE_APPEND_ENTRIES_RESPONSE;
+           type == RAFT_WIRE_APPEND_ENTRIES_RESPONSE ||
+           type == RAFT_WIRE_LOG_STATUS_REQUEST ||
+           type == RAFT_WIRE_LOG_STATUS_RESPONSE;
 }
 
 const char *raft_wire_status_name(raft_wire_status_t status)

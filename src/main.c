@@ -3,6 +3,7 @@
 #include "raft_tcp.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
+#include "raft_replicate_client.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -354,6 +355,34 @@ static int request_vote_peer(const char *path, const char *peer_text,
     return 0;
 }
 
+static int append_demo_peer(const char *path, const char *peer_text,
+                            const char *term_text, const char *prev_index_text,
+                            const char *prev_term_text, const char *command)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    uint64_t peer, term, prev_index, prev_term;
+    if (parse_decimal_u64(peer_text, &peer) != 0 || peer > UINT32_MAX ||
+        parse_decimal_u64(term_text, &term) != 0 ||
+        parse_decimal_u64(prev_index_text, &prev_index) != 0 ||
+        parse_decimal_u64(prev_term_text, &prev_term) != 0) {
+        fputs("Invalid append-demo arguments\n", stderr);
+        return 1;
+    }
+    return raft_replicate_client_send(&config, (raft_node_id_t)peer, term,
+                      prev_index, prev_term, (const uint8_t *)command,
+                      strlen(command)) == 0 ? 0 : 1;
+}
+
+static int log_status_peer(const char *path, const char *peer_text)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    uint64_t peer;
+    if (parse_decimal_u64(peer_text, &peer) != 0 || peer > UINT32_MAX) return 1;
+    return raft_replicate_client_log_status(&config, (raft_node_id_t)peer) == 0 ? 0 : 1;
+}
+
 /* Logical-time example: no waiting, network traffic, voting, or role change. */
 static int timer_demo(const char *path)
 {
@@ -393,7 +422,9 @@ static void usage(void)
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
           "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
-          "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM]\n", stderr);
+          "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
+          "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
+          "--log-status PATH PEER_ID]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -436,6 +467,10 @@ int main(int argc, char **argv)
         return ping_peer(argv[2], argv[3], argv[4]);
     if (argc == 7 && strcmp(argv[1], "--request-vote") == 0)
         return request_vote_peer(argv[2], argv[3], argv[4], argv[5], argv[6]);
+    if (argc == 8 && strcmp(argv[1], "--append-demo") == 0)
+        return append_demo_peer(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    if (argc == 4 && strcmp(argv[1], "--log-status") == 0)
+        return log_status_peer(argv[2], argv[3]);
     usage();
     return 1;
 }

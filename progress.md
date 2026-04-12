@@ -286,3 +286,33 @@ handlers must hold the node mutex and check leader term before calling
 `raft_log_reconcile`. The private learning PDF is outside the repository.
 
 **Commit:** `feat: add conflict-safe in-memory raft log reconciliation`
+
+
+## Phase 12 / 35 - AppendEntries entry batches over TCP
+
+**Budget:** ~2 hours. **Planned slot:** January 12, 2027.
+
+**Deliverable:** a C follower accepts a bounded, binary-safe batch of Raft
+log entries over framed TCP, checks `(prev_index, prev_term)` under the node
+mutex, repairs the uncommitted suffix, and replies success or failure.
+
+- [x] Preserve the legacy 36-byte empty heartbeat format
+- [x] Add entry-count and variable-length command serialization (<=4096 bytes)
+- [x] Validate payload boundaries, term order, entry counts and membership
+- [x] Deep-copy accepted commands into follower-owned memory
+- [x] Reject stale terms, nonexistent prefixes and committed conflicts
+- [x] Extend live TCP AppendEntries server handler
+- [x] Add one-shot `--append-demo` and `--log-status` developer probes
+- [x] Unit tests with binary data, malformed frames and rollback behavior
+- [x] Real TCP integration tests for multiple entries and suffix repair
+- [x] Run complete existing regression suite
+- [ ] Validate on personal Fedora installation
+- [ ] Review changes and commit with actual date and time
+
+**Verify:** `make clean && make && make test`.
+
+**Not yet complete:** elected-leader proposal path, nextIndex/matchIndex,
+automatic retries, quorum commits, durable storage, replicated application.
+Learning PDF remains external and must never be committed.
+
+**Commit:** `feat: replicate bounded raft log batches over framed TCP`

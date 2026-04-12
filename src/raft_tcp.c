@@ -246,19 +246,20 @@ static void process_client(int fd, tcp_server_t *server)
             (void)fflush(stdout);
         }
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_APPEND_ENTRIES) {
-        raft_append_request_t req;
+        raft_append_batch_t batch;
         raft_append_response_t rsp;
         uint8_t output[RAFT_APPEND_RESPONSE_BYTES];
         uint64_t now_ms = 0;
-        if (raft_append_decode_request(payload, length, &req) != RAFT_OK ||
-            raft_config_peer_for_id(&server->config, req.leader_id) == NULL ||
-            req.leader_id == server->node_id ||
+        if (raft_append_decode_batch(payload, length, &batch) != RAFT_OK ||
+            raft_config_peer_for_id(&server->config, batch.header.leader_id) == NULL ||
+            batch.header.leader_id == server->node_id ||
             raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
             fputs("Rejected malformed or nonmember AppendEntries\n", stderr);
             return;
         }
         (void)pthread_mutex_lock(&server->mutex);
-        raft_status_t result = raft_append_handle(&server->vote_node, &req, now_ms, &rsp);
+        raft_status_t result = raft_append_handle_batch(&server->vote_node, &batch, now_ms, &rsp);
+        raft_index_t last = raft_log_last_index(&server->vote_node.log);
         (void)pthread_mutex_unlock(&server->mutex);
         if (result != RAFT_OK ||
             raft_append_encode_response(&rsp, output) != RAFT_OK) {
@@ -267,7 +268,30 @@ static void process_client(int fd, tcp_server_t *server)
         }
         status = raft_wire_send(fd, RAFT_WIRE_APPEND_ENTRIES_RESPONSE,
                                 output, sizeof(output), message, sizeof(message));
-        /* Heartbeat traffic is intentionally not logged on every request. */
+        if (status == RAFT_WIRE_OK && batch.entry_count != 0) {
+            printf("Log replication: follower=%u entries=%zu success=%d last_index=%llu\n",
+                   server->node_id, batch.entry_count, rsp.success,
+                   (unsigned long long)last);
+            (void)fflush(stdout);
+        }
+        /* Empty heartbeat traffic is intentionally not logged. */
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_LOG_STATUS_REQUEST &&
+               length == 0) {
+        /* Read-only diagnostics: last_index:u64, last_term:u64, commit:u64. */
+        uint8_t out[24];
+        raft_index_t index, committed;
+        raft_term_t term = 0;
+        (void)pthread_mutex_lock(&server->mutex);
+        index = raft_log_last_index(&server->vote_node.log);
+        committed = server->vote_node.commit_index;
+        (void)raft_log_term_at(&server->vote_node.log, index, &term);
+        (void)pthread_mutex_unlock(&server->mutex);
+        uint64_t numbers[] = {index, term, committed};
+        for (size_t i = 0; i < 3; ++i)
+            for (unsigned b = 0; b < 8; ++b)
+                out[i * 8 + b] = (uint8_t)(numbers[i] >> (56u - 8u*b));
+        (void)raft_wire_send(fd, RAFT_WIRE_LOG_STATUS_RESPONSE,
+                             out, sizeof(out), message, sizeof(message));
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_STATUS_REQUEST &&
                length == 0) {
         /* Read-only debug status: node_id:u32 term:u64 role:u8 voted_for:u32. */

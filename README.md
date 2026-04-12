@@ -3,15 +3,15 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 11 / 35 - In-memory log matching and suffix reconciliation.**
-A fixed three-node cluster can elect a leader, periodically exchange
-zero-entry AppendEntries heartbeats, reset followers' election timers and
-reelect another leader after a failure. Phase 11 adds an independently
-tested **in-memory** log consistency and conflict-repair library (not yet wired
-into the network RPC). This is a **learning implementation**:
-term/vote state remains in memory, network AppendEntries carries no log entries, and
-there is no durability, authentication, quorum-loss detection or production
-leader-lease guarantee. Bind test nodes only to trusted loopback addresses.
+**Current milestone: Phase 12 / 35 - AppendEntries entry replication over TCP.**
+A fixed three-node cluster can elect a leader and maintain ordinary heartbeat
+stability. Followers now accept bounded, binary-safe batches of log entries
+through AppendEntries, repair conflicting uncommitted suffixes and reject stale
+terms. The `--append-demo` CLI sends a developer-specified request to a running
+node; it is **not** a verified elected-leader proposal or majority commit.
+Persistence, leader progress tracking, automatic catch-up, quorum commits,
+client writes, authentication and a state machine remain future work.
+Run only on a trusted loopback test network.
 
 ## Implemented through Phase 8
 
@@ -361,3 +361,47 @@ correct leaders do not produce different commands at the same index and term.
 
 **Repository hygiene:** Learning PDFs are delivered separately; `.gitignore`
 excludes `*.pdf` and `learning-guides/`.
+
+## Phase 12: AppendEntries entry replication over TCP
+
+Build and run all tests:
+
+```sh
+make clean && make && make test
+./build/test_raft_replication
+python3 tests/test_replication_integration.py ./build/raft-engine
+```
+
+In Terminal A, start a standalone receiver (NOT an election cluster):
+
+```sh
+./build/raft-engine --serve config/node2.conf
+```
+
+In Terminal B, send a diagnostic AppendEntries command from configured node 1:
+
+```sh
+./build/raft-engine --append-demo config/node1.conf 2 3 0 0 "SET x 1"
+./build/raft-engine --log-status config/node1.conf 2
+./build/raft-engine --append-demo config/node1.conf 2 4 1 3 "SET y 2"
+./build/raft-engine --log-status config/node1.conf 2
+```
+
+`--append-demo CONFIG PEER TERM PREV_INDEX PREV_TERM COMMAND` transmits
+**one entry** (term = TERM) and prints the follower response. Test harnesses
+also exercise multi-entry binary batches. `--log-status` returns last index,
+last term and follower commit index; it does not expose command values.
+
+These are developer-only probes: they do not consult the actual leader role,
+update `nextIndex`/`matchIndex`, or prove a majority has received entries.
+Use a fresh `--serve` receiver when repeating the demo; memory-only logs are
+lost on restart. `--elect` remains the heartbeat/election test mode.
+
+**Wire extension:** 36-byte AppendEntries header, followed (if nonempty) by a
+2-byte big-endian count and up to 16 entries (`u64 term`, `u16 length`, raw
+command bytes). The existing 36-byte empty heartbeat remains valid. All
+messages are capped at 4096 bytes. Incorrect lengths, unknown IDs, stale terms,
+missing previous entries and committed conflicts are rejected.
+
+**Phase 13:** follower replication progress (`nextIndex`, `matchIndex`), retry
+logic and eventual majority acknowledgement tracking.

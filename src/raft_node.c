@@ -51,7 +51,7 @@ const char *raft_role_name(raft_role_t role)
     case RAFT_FOLLOWER: return "follower";
     case RAFT_CANDIDATE: return "candidate";
     case RAFT_LEADER: return "leader";
-    default: return "invalid";
+    default: return "unknown";
     }
 }
 
