@@ -24,7 +24,9 @@ typedef enum {
     RAFT_WIRE_APPEND_ENTRIES = 7,
     RAFT_WIRE_APPEND_ENTRIES_RESPONSE = 8,
     RAFT_WIRE_LOG_STATUS_REQUEST = 9,
-    RAFT_WIRE_LOG_STATUS_RESPONSE = 10
+    RAFT_WIRE_LOG_STATUS_RESPONSE = 10,
+    RAFT_WIRE_DEMO_PROPOSE = 11, /* development-only, NOT production API */
+    RAFT_WIRE_DEMO_PROPOSE_RESPONSE = 12
 } raft_wire_type_t;
 
 typedef enum {

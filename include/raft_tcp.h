@@ -37,8 +37,8 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity);
 
-/* Run automatic RequestVote elections plus periodic empty AppendEntries
- * heartbeats. Terms/votes are not durable; log replication comes later. */
+/* Run RequestVote elections and periodic bounded log-bearing AppendEntries.
+ * Per-peer progress/retries are memory only. No majority commit yet. */
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity);
 

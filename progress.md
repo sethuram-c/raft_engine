@@ -316,3 +316,56 @@ automatic retries, quorum commits, durable storage, replicated application.
 Learning PDF remains external and must never be committed.
 
 **Commit:** `feat: replicate bounded raft log batches over framed TCP`
+
+## Phase 13 / 35 - Leader-side replication progress and retry
+
+**Time budget:** ~2 hours  
+**Planned milestone:** January 13, 2027 (use the actual completion date)
+
+### Deliverable
+
+Elected leaders track each peer's `nextIndex` and `matchIndex`, send bounded
+AppendEntries batches instead of only empty heartbeats, decrease `nextIndex`
+on a log mismatch and retry on later cycles. A development-only `--propose-demo`
+command appends an uncommitted entry to the elected leader to make automatic
+replication observable. This is **not** a production client proposal API.
+
+### Acceptance criteria
+
+- [x] Separate per-peer replication state, initialized on each leadership term
+- [x] Request `prevLogIndex` and `prevLogTerm` reflect each follower's next index
+- [x] Limit entry-bearing batches to 16 entries / 4096 encoded payload bytes
+- [x] Success updates confirmed `matchIndex` and advances `nextIndex`
+- [x] Failure backs off `nextIndex`, conservatively clearing stale match progress
+- [x] Transport errors leave retry position unchanged
+- [x] Higher-term response triggers step-down without applying stale progress
+- [x] Encode borrowed command data under mutex, send TCP RPC outside mutex
+- [x] Follower-only nodes reject development-only proposals
+- [x] Real three-process integration covers offline follower and restart catch-up
+- [x] Existing strong log/node regression checks remain enabled
+- [x] All prior phase regression tests pass
+- [ ] Run on personal Fedora hardware and review actual Git diff before commit
+
+### Verify
+
+```sh
+make clean && make && make test
+./build/test_raft_progress
+python3 tests/test_progress_integration.py ./build/raft-engine
+# Three terminals: --elect config/node1.conf, node2.conf, node3.conf
+# After identifying the elected leader (example: 2):
+./build/raft-engine --propose-demo config/node1.conf 2 "SET demo 13"
+./build/raft-engine --log-status config/node1.conf 2
+./build/raft-engine --log-status config/node1.conf 3
+```
+
+### Git message
+
+```text
+feat: track raft follower replication progress and retry log batches
+```
+
+**Scope limit:** `matchIndex` is a leader-side observation, not a commit index.
+`commitIndex` does not advance on leader proposal. Nodes lose memory-only logs,
+terms and votes on restart; diagnostic RPC lacks authentication and should be
+used on loopback only. Majority-based commitment is Phase 14.

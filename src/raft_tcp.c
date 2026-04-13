@@ -5,6 +5,7 @@
 #include "raft_vote.h"
 #include "raft_election.h"
 #include "raft_append.h"
+#include "raft_replication.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -200,6 +201,7 @@ struct tcp_server {
     pthread_t election_thread;
     bool election_thread_started;
     atomic_bool election_stop;
+    raft_replication_progress_t progress[RAFT_ELECTION_CLUSTER_SIZE];
 };
 
 static void process_client(int fd, tcp_server_t *server)
@@ -275,6 +277,36 @@ static void process_client(int fd, tcp_server_t *server)
             (void)fflush(stdout);
         }
         /* Empty heartbeat traffic is intentionally not logged. */
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_DEMO_PROPOSE &&
+               length != 0 && length <= 1024) {
+        /* Explicitly educational, unauthenticated command injection.
+         * Disabled for followers and --serve; never implies a commit. */
+        uint8_t out[17] = {0};
+        int accepted = 0;
+        raft_index_t index = 0;
+        raft_term_t term;
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_node_t *node = &server->vote_node;
+        term = node->current_term;
+        if (node->role == RAFT_LEADER && term != 0 &&
+            raft_log_append(&node->log, term, payload, length) == RAFT_OK) {
+            accepted = 1;
+            index = raft_log_last_index(&node->log);
+        }
+        (void)pthread_mutex_unlock(&server->mutex);
+        for (unsigned b = 0; b < 8; ++b) {
+            out[b] = (uint8_t)(term >> (56u - 8u*b));
+            out[8+b] = (uint8_t)(index >> (56u - 8u*b));
+        }
+        out[16] = (uint8_t)accepted;
+        (void)raft_wire_send(fd, RAFT_WIRE_DEMO_PROPOSE_RESPONSE,
+                             out, sizeof(out), message, sizeof(message));
+        if (accepted) {
+            printf("Demo proposal: leader=%u term=%llu index=%llu uncommitted\n",
+                   server->node_id, (unsigned long long)term,
+                   (unsigned long long)index);
+            (void)fflush(stdout);
+        }
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_LOG_STATUS_REQUEST &&
                length == 0) {
         /* Read-only diagnostics: last_index:u64, last_term:u64, commit:u64. */
@@ -466,15 +498,15 @@ static int request_peer_vote(const raft_peer_config_t *peer,
 }
 
 
-/* Heartbeats are empty AppendEntries RPCs in Phase 10.  No socket I/O
- * takes place while holding the shared Raft node mutex. */
+/* Phase 13: send either entry-bearing batches or empty heartbeats.
+ * Encode while holding the mutex, and perform TCP I/O outside it. */
 #define RAFT_HEARTBEAT_INTERVAL_MS 90u
 #define RAFT_HEARTBEAT_CONNECT_MS 80
 #define RAFT_HEARTBEAT_IO_TIMEOUT_US 95000
 
-static int send_peer_heartbeat(const raft_peer_config_t *peer,
-                               const raft_append_request_t *request,
-                               raft_append_response_t *response)
+static int send_peer_replication(const raft_peer_config_t *peer,
+                                 const uint8_t *payload, size_t length,
+                                 raft_append_response_t *response)
 {
     char error[256];
     int fd = raft_tcp_connect(peer, RAFT_HEARTBEAT_CONNECT_MS, error, sizeof(error));
@@ -485,22 +517,17 @@ static int send_peer_heartbeat(const raft_peer_config_t *peer,
         (void)close(fd);
         return -1;
     }
-    uint8_t payload[RAFT_APPEND_REQUEST_BYTES];
-    if (raft_append_encode_request(request, payload) != RAFT_OK) {
-        (void)close(fd);
-        return -1;
-    }
     raft_wire_status_t result = raft_wire_send(fd, RAFT_WIRE_APPEND_ENTRIES,
-                               payload, sizeof(payload), error, sizeof(error));
+                                payload, length, error, sizeof(error));
     uint8_t reply[RAFT_APPEND_RESPONSE_BYTES];
     raft_wire_type_t type = RAFT_WIRE_PING;
-    size_t length = 0;
+    size_t reply_length = 0;
     if (result == RAFT_WIRE_OK)
-        result = raft_wire_recv(fd, &type, reply, sizeof(reply), &length,
+        result = raft_wire_recv(fd, &type, reply, sizeof(reply), &reply_length,
                                 error, sizeof(error));
     (void)close(fd);
     return result == RAFT_WIRE_OK && type == RAFT_WIRE_APPEND_ENTRIES_RESPONSE &&
-           raft_append_decode_response(reply, length, response) == RAFT_OK ? 0 : -1;
+           raft_append_decode_response(reply, reply_length, response) == RAFT_OK ? 0 : -1;
 }
 
 static void *election_worker_main(void *argument)
@@ -515,7 +542,7 @@ static void *election_worker_main(void *argument)
         raft_vote_request_t request;
         bool begin = false;
         bool heartbeat = false;
-        raft_append_request_t heartbeat_request = {0};
+        raft_term_t heartbeat_term = 0;
         (void)pthread_mutex_lock(&server->mutex);
         raft_node_t *node = &server->vote_node;
         if (node->role != RAFT_LEADER &&
@@ -532,12 +559,7 @@ static void *election_worker_main(void *argument)
             (void)fflush(stdout);
         }
         if (node->role == RAFT_LEADER && now >= next_heartbeat_ms) {
-            raft_index_t last_index = raft_log_last_index(&node->log);
-            raft_term_t last_term = 0;
-            (void)raft_log_term_at(&node->log, last_index, &last_term);
-            heartbeat_request = (raft_append_request_t){
-                node->current_term, node->id, last_index, last_term, node->commit_index
-            };
+            heartbeat_term = node->current_term;
             heartbeat = true;
             next_heartbeat_ms = now + RAFT_HEARTBEAT_INTERVAL_MS;
         }
@@ -547,14 +569,42 @@ static void *election_worker_main(void *argument)
                 if (atomic_load(&server->election_stop) || stop_requested) break;
                 const raft_peer_config_t *peer = &server->config.peers[i];
                 if (peer->id == server->node_id) continue;
+                uint8_t payload[RAFT_WIRE_MAX_PAYLOAD];
+                raft_append_batch_t batch;
+                raft_index_t sent_through = 0;
+                size_t payload_length = 0;
+                (void)pthread_mutex_lock(&server->mutex);
+                bool valid = server->vote_node.role == RAFT_LEADER &&
+                    server->vote_node.current_term == heartbeat_term &&
+                    server->progress[i].term == heartbeat_term &&
+                    server->progress[i].peer_id == peer->id &&
+                    raft_replication_prepare(&server->vote_node,
+                        &server->progress[i], &batch, &sent_through) == RAFT_OK &&
+                    raft_append_encode_batch(&batch, payload, sizeof(payload),
+                                             &payload_length) == RAFT_OK;
+                size_t entries = valid ? batch.entry_count : 0;
+                (void)pthread_mutex_unlock(&server->mutex);
+                if (!valid) break;
                 raft_append_response_t reply;
-                if (send_peer_heartbeat(peer, &heartbeat_request, &reply) != 0) continue;
+                if (send_peer_replication(peer, payload, payload_length, &reply) != 0)
+                    continue; /* network failure retains nextIndex for retry */
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
                 raft_role_t old = server->vote_node.role;
                 (void)raft_append_handle_response(&server->vote_node, &reply, now);
                 bool still_leader = server->vote_node.role == RAFT_LEADER &&
-                    server->vote_node.current_term == heartbeat_request.term;
+                    server->vote_node.current_term == heartbeat_term;
+                if (still_leader) {
+                    (void)raft_replication_observe(&server->progress[i],
+                                                    sent_through, &reply);
+                    if (entries && reply.success) {
+                        printf("Replicated: leader=%u follower=%u matchIndex=%llu nextIndex=%llu\n",
+                               server->node_id, peer->id,
+                               (unsigned long long)server->progress[i].match_index,
+                               (unsigned long long)server->progress[i].next_index);
+                        (void)fflush(stdout);
+                    }
+                }
                 if (old == RAFT_LEADER && !still_leader) {
                     printf("Leader stepped down: node=%u term=%llu\n", server->node_id,
                            (unsigned long long)server->vote_node.current_term);
@@ -583,7 +633,14 @@ static void *election_worker_main(void *argument)
                            (unsigned long long)server->vote_node.current_term,
                            round.votes);
                     (void)fflush(stdout);
-                    next_heartbeat_ms = 0; /* send first heartbeat next loop */
+                    raft_index_t last = raft_log_last_index(&server->vote_node.log);
+                    for (size_t j = 0; j < server->config.peer_count; ++j) {
+                        raft_node_id_t id = server->config.peers[j].id;
+                        if (id == server->node_id) continue;
+                        (void)raft_replication_progress_init(&server->progress[j],
+                              id, server->vote_node.current_term, last);
+                    }
+                    next_heartbeat_ms = 0; /* send first AppendEntries next loop */
                 }
                 bool continuing = server->vote_node.role == RAFT_CANDIDATE &&
                                   server->vote_node.current_term == round.term;

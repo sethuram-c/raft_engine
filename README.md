@@ -405,3 +405,47 @@ missing previous entries and committed conflicts are rejected.
 
 **Phase 13:** follower replication progress (`nextIndex`, `matchIndex`), retry
 logic and eventual majority acknowledgement tracking.
+
+## Phase 13: automatic leader replication and follower catch-up
+
+In `--elect` mode, the leader now tracks **per-follower** `nextIndex` and
+`matchIndex` and repeatedly sends bounded batches of actual log entries.
+Failed prefix matches decrease `nextIndex` for the next attempt; network
+failures leave the retry position unchanged. Higher-term replies cause
+step-down. Batches still use the Phase 12 AppendEntries format (up to 16 entries,
+4096 bytes) and empty batches remain ordinary heartbeats.
+
+To create an entry on the **currently elected leader**, use this educational
+CLI in a fourth terminal, choosing another node's config as the source:
+
+```sh
+# Terminal 1, 2, 3 (run concurrently):
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+
+# Observe roles, then replace 2 with the actual leader ID:
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 "SET alpha 1"
+./build/raft-engine --log-status config/node1.conf 2
+./build/raft-engine --log-status config/node1.conf 3
+
+# New tests:
+./build/test_raft_progress
+python3 tests/test_progress_integration.py ./build/raft-engine
+```
+
+`--propose-demo` is a **loopback-only, unauthenticated development command**.
+It accepts 1–1024 bytes and rejects nonleaders. Success means appended to the
+leader's *in-memory, uncommitted* log. It does **not** acknowledge majority
+replication, commit, persistence, or state-machine execution. Do not expose
+this listener on untrusted networks or use it as a production API.
+
+The Phase 13 integration test starts three real servers on random loopback
+ports, waits for election, appends entries, stops and restarts a follower,
+checks automatic catch-up, and asserts `commitIndex` remains zero. The
+stronger legacy log/node checks include an invalid-role `"unknown"` contract.
+
+See `docs/architecture.md` and the separate Phase 13 learning PDF. Next:
+**Phase 14 - majority commit tracking**, including the current-term Raft commit
+rule and explicit separation of acknowledged replication from committed data.

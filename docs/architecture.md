@@ -327,3 +327,88 @@ Important distinctions:
 - State is not persisted and RPC senders are not authenticated. Bind to
   loopback addresses and never deploy in an untrusted network.
 - The log status endpoint reports index/term/commit, not complete commands.
+
+## Phase 13 - Per-follower leader replication progress
+
+`--elect` mode now uses a leader-side AppendEntries replication loop instead
+of sending only empty heartbeats. The existing bounded TCP worker pool receives
+AppendEntries and reconciles each follower log just as in Phase 12.
+
+```text
+                       elected leader
+                    node + log under mutex
+                              |
+                 progress[peer] (term, nextIndex, matchIndex)
+                              |
+              raft_replication_prepare()  <-- log slices borrowed
+                              |
+                     encode batch under lock
+                              |
+                            unlock
+                              |
+               framed TCP AppendEntries request
+                              |
+                   follower consistency check
+                              |
+                       AppendEntriesResponse
+                              |
+                     lock current-term node
+                              |
+            +-----------------+------------------+
+       reply.term higher  reply.success=1   reply.success=0
+        leader steps down   match=sentThrough   nextIndex--
+                           next=match+1     match<=next-1
+```
+
+`include/raft_replication.h` and `src/raft_replication.c` are transport-free:
+
+- `raft_replication_progress_init` seeds `nextIndex=leader_last+1`, `matchIndex=0`.
+- `raft_replication_prepare` creates a bounded `raft_append_batch_t` from
+  `nextIndex`, deriving `(prev_index,prev_term)` from the leader's log.
+  Borrowed pointers are encoded while the node mutex is held.
+- `raft_replication_observe` advances progress only for replies in the same
+  term and backs off on rejections; network failures do not move indices.
+- A newly elected leader initializes all non-self progress slots afresh.
+- `raft_append_handle_response()` handles higher terms before any progress
+  update. The election loop rejects replies if leadership/term changed.
+
+The existing heartbeat interval is approximately 90ms; a peer whose
+`nextIndex` is beyond the log tail receives a 36-byte empty AppendEntries
+heartbeat, while a peer with missing entries receives up to 16 bounded entries.
+Rejections cause `nextIndex` to decrement (not below 1); the next loop retries
+from an earlier preceding entry. This is deliberately simple linear backoff,
+not optimized conflict-hint backtracking or pipelining.
+
+### New development-only proposal RPC
+
+Wire types **11 (DEMO_PROPOSE)** and **12 (DEMO_PROPOSE_RESPONSE)** allow the
+CLI `--propose-demo CONFIG LEADER_ID COMMAND` to append a 1–1024-byte raw
+command **only to an elected leader**, guarded by the same node mutex. The
+response is `term:u64 | last_index:u64 | accepted:u8` (17 bytes). This operation
+is intentionally unauthenticated, loopback-only and not a consensus commit;
+`commit_index` stays unchanged. It is provided solely to exercise automatic
+leader-to-follower replication before the production client API phase.
+
+Use `--log-status CONFIG PEER_ID` to inspect each peer's
+`(last_index,last_term,commit_index)`. The test harness proves that a restarted,
+empty in-memory follower causes a prefix mismatch, triggering repeated
+backoff and successful full catch-up. It also tests that the healthy follower
+continues progressing while one peer is stopped.
+
+### Concurrency and lifetime
+
+Every access to the leader's log and replication array uses `server->mutex`.
+`raft_append_batch_t.entries[i].command` points into the leader's log and may
+be invalidated by mutation; therefore `raft_append_encode_batch` completes
+before the mutex is released. `raft_wire_send`, `raft_wire_recv` and socket
+connect are performed after the mutex is released, allowing worker threads to
+serve inbound RPCs. On return, the election thread rechecks role and term;
+late replies cannot grant progress to a different leadership term.
+
+### What Phase 13 does not do
+
+No majority-based commitment, state-machine application, stable storage,
+authenticated clients, membership change, conflict-hint optimization or
+production-grade request pipelining. The uncommitted demo entries disappear
+when a process restarts. `matchIndex` is not by itself proof that a command
+is committed or safe to expose to a client.

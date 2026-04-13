@@ -109,3 +109,33 @@ int raft_replicate_client_log_status(const raft_cluster_config_t *config,
            (unsigned long long)read_u64(data+16));
     return 0;
 }
+
+/* Local diagnostic only: no authentication, no majority commitment. */
+int raft_replicate_client_demo_propose(const raft_cluster_config_t *config,
+                                       raft_node_id_t peer_id,
+                                       const uint8_t *command, size_t len)
+{
+    if (config == NULL || command == NULL || len == 0 || len > 1024) return -1;
+    char error[256];
+    int fd = connect_peer(config, peer_id, error);
+    if (fd < 0) { fprintf(stderr, "Connect failed: %s\n", error); return -1; }
+    raft_wire_status_t status = raft_wire_send(fd, RAFT_WIRE_DEMO_PROPOSE,
+                                  command, len, error, sizeof(error));
+    raft_wire_type_t type = 0;
+    uint8_t reply[17];
+    size_t reply_len = 0;
+    if (status == RAFT_WIRE_OK)
+        status = raft_wire_recv(fd, &type, reply, sizeof(reply), &reply_len,
+                                error, sizeof(error));
+    (void)close(fd);
+    if (status != RAFT_WIRE_OK || type != RAFT_WIRE_DEMO_PROPOSE_RESPONSE ||
+        reply_len != sizeof(reply) || reply[16] > 1) {
+        fprintf(stderr, "Demo proposal failed: %s\n",
+                status == RAFT_WIRE_OK ? "invalid response" : error);
+        return -1;
+    }
+    printf("Demo proposal: peer=%u term=%llu index=%llu accepted=%u (uncommitted)\n",
+           peer_id, (unsigned long long)read_u64(reply),
+           (unsigned long long)read_u64(reply+8), reply[16]);
+    return reply[16] ? 0 : 2;
+}
