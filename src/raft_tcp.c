@@ -6,6 +6,7 @@
 #include "raft_election.h"
 #include "raft_append.h"
 #include "raft_replication.h"
+#include "raft_commit.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -597,6 +598,25 @@ static void *election_worker_main(void *argument)
                 if (still_leader) {
                     (void)raft_replication_observe(&server->progress[i],
                                                     sent_through, &reply);
+                    /* Successful same-term AppendEntries acknowledgements
+                     * may move the majority-backed commit index. All node
+                     * and peer progress fields remain under the same mutex. */
+                    raft_replication_progress_t followers[RAFT_CLUSTER_SIZE - 1];
+                    size_t follower_count = 0;
+                    for (size_t j = 0; j < server->config.peer_count; ++j) {
+                        if (server->config.peers[j].id == server->node_id) continue;
+                        followers[follower_count++] = server->progress[j];
+                    }
+                    raft_index_t previous_commit = server->vote_node.commit_index;
+                    raft_index_t new_commit = previous_commit;
+                    if (raft_commit_advance(&server->vote_node, followers,
+                                             follower_count, &new_commit) == RAFT_OK &&
+                        new_commit > previous_commit) {
+                        printf("Commit advanced: leader=%u term=%llu commitIndex=%llu\n",
+                               server->node_id, (unsigned long long)heartbeat_term,
+                               (unsigned long long)new_commit);
+                        (void)fflush(stdout);
+                    }
                     if (entries && reply.success) {
                         printf("Replicated: leader=%u follower=%u matchIndex=%llu nextIndex=%llu\n",
                                server->node_id, peer->id,

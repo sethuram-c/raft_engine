@@ -1,4 +1,7 @@
-# Raft Engine Architecture - Through Phase 12
+# Raft Engine Architecture - Through Phase 14
+
+The early sections are preserved as **historical phase snapshots**. For the
+current behavior, refer to the Phase 14 summary at the bottom of this file.
 
 Historical sections below describe the earlier milestones; the current
 Phase 12 architecture and protocol are summarized at the end.
@@ -412,3 +415,64 @@ authenticated clients, membership change, conflict-hint optimization or
 production-grade request pipelining. The uncommitted demo entries disappear
 when a process restarts. `matchIndex` is not by itself proof that a command
 is committed or safe to expose to a client.
+
+
+## Phase 14: majority commit flow (current implementation)
+
+```
+Development proposal --> leader in-memory log, index N
+                            |
+                periodic leader replication (Phase 13)
+                            |
+          follower AppendEntries success, same term
+                            |
+           mutex: update follower matchIndex
+                            |
+      raft_commit_advance(leader, progress[2])
+                            |
+       majority index = median(leader last, match2, match3)
+                            |
+       is majority index > commitIndex AND
+         log[majority index].term == currentTerm ?
+                       /          \
+                     YES          NO
+                     /              \
+     commitIndex = majority      no change
+                     |
+        next replication heartbeat carries leaderCommit
+                     |
+       follower checks matching prefix, then caps commit
+```
+
+**API:** `include/raft_commit.h` / `src/raft_commit.c` owns the deterministic
+three-voter quorum algorithm. The caller must hold the existing TCP server
+mutex. Input is a validated leader and two distinct, current-term follower
+progress records. The output is the updated leader `commitIndex`, but the
+function does not apply commands, touch `lastApplied`, or perform I/O.
+
+**Integration:** `src/raft_tcp.c` serializes reply handling, replication
+progress updates and commit calculation under one mutex. On a successful
+same-term follower acknowledgement, the progress array is copied under lock
+and the majority index is calculated; an update is printed only when the
+watermark increases. Subsequent `raft_replication_prepare()` calls include
+`leaderCommit` in existing AppendEntries headers, without adding wire types.
+
+**Invariant:** `0 <= lastApplied <= commitIndex <= lastLogIndex`. Direct
+commit of an older-term entry is forbidden, even if it exists on two of three
+nodes. A newly committed current-term entry indirectly commits all preceding
+entries. Follower commit advancement is bounded by the successfully matched
+prefix of its current AppendEntries RPC. No new commit is possible on the
+leader's unilateral acknowledgement.
+
+**Tests:** `tests/test_raft_commit.c` (72 assertions),
+`tests/test_commit_integration.py` (three processes, quorum, lost quorum,
+rejoin), plus a Phase 13 regression adapted to eventual commit propagation.
+All previous Phase 1–12 checks are retained.
+
+**Security/crash caveat:** The existing diagnostic proposal path has no
+identity/authentication checks. This implementation has no disk persistence;
+restart loses acknowledgements, committed entries, and term/vote state.
+Therefore a majority in the current prototype is NOT a durable quorum.
+Do not use it for data where Raft's real crash-safety guarantees are needed.
+The key-value apply loop, client acknowledgement after commit, durable WAL,
+snapshots and crash recovery are future milestones.

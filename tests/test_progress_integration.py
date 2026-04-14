@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 13: live leader-driven AppendEntries, late join and restart catch-up."""
+"""Phase 13 replication regression, updated for Phase 14 majority commits."""
 from __future__ import annotations
 import signal
 import socket
@@ -131,6 +131,7 @@ def main(binary):
                                  capture_output=True, text=True, timeout=3)
             assert cli.returncode == 0 and 'accepted=1' in cli.stdout, cli
             assert 'index=1' in cli.stdout and 'uncommitted' in cli.stdout
+            # "uncommitted" describes proposal admission, not later quorum confirmation.
             wait_for(lambda: all(log(n) and log(n)[0] == 1 for n in (1, 2, 3)))
             print('PASS: elected leader automatically replicates a new entry to both followers')
             stop(follower)
@@ -140,14 +141,16 @@ def main(binary):
             print('PASS: available follower progresses despite a disconnected peer')
             start(follower)  # loses both entries: follower progress must back off
             wait_for(lambda: log(follower) and log(follower)[0] == 2, 9)
+            wait_for(lambda: all(log(n) and log(n)[2] == 2 for n in (1, 2, 3)))
             all_logs = [log(n) for n in (1, 2, 3)]
-            assert all(x is not None and x[0] == 2 and x[2] == 0 for x in all_logs), all_logs
-            print('PASS: restarted, empty follower catches up automatically using nextIndex retries')
+            assert all(x is not None and x[0] == 2 and x[2] == 2 for x in all_logs), all_logs
+            print('PASS: restarted, empty follower catches up using nextIndex retries and receives commit')
             ans = proposed(leader, b'SET gamma 3')
             assert ans == (term, 3, 1), ans
-            wait_for(lambda: all(log(n) and log(n)[0] == 3 for n in (1, 2, 3)))
+            wait_for(lambda: all(log(n) and log(n)[0] == 3 and log(n)[2] == 3
+                                 for n in (1, 2, 3)))
             assert stable() == (leader, term)
-            print('PASS: subsequent replication remains healthy and uncommitted')
+            print('PASS: subsequent replication and majority-based commitment remain healthy')
         except Exception:
             for f in logs:
                 f.flush()

@@ -369,3 +369,37 @@ feat: track raft follower replication progress and retry log batches
 `commitIndex` does not advance on leader proposal. Nodes lose memory-only logs,
 terms and votes on restart; diagnostic RPC lacks authentication and should be
 used on loopback only. Majority-based commitment is Phase 14.
+
+
+## Phase 14 / 35 - Current-term majority commit tracking
+
+**Planned slot:** January 14, 2027 (the actual Git commit date should reflect reality).
+**Target:** Convert leader-side `matchIndex` observations into Raft's
+majority-backed `commitIndex` and deliver the commit watermark to followers.
+
+- [x] Implement pure, mutex-external `raft_commit_advance()` helper
+- [x] Include the leader as one voter and require both configured follower slots
+- [x] Validate peer IDs, distinctness, same term and replication-index bounds
+- [x] Select the 2nd-highest index among the leader and two followers
+- [x] Directly commit only current-term majority entries
+- [x] Preserve monotonic `commitIndex` across stale/failed observations
+- [x] Feed updated `leaderCommit` through existing AppendEntries heartbeats
+- [x] Follower caps commit index to successfully matched log prefix
+- [x] Add 72 focused assertions and no-quorum/rejoin live TCP integration
+- [x] Update Phase 13 live regression to expect eventual commits
+- [x] Preserve the stronger legacy log/node test coverage and `"unknown"` role contract
+- [x] Run full Phase 1–14 regression suite successfully
+- [x] Run focused Phase 14 and Phase 13 integration checks under Clang ASan/UBSan
+- [ ] Verify on personal Fedora installation
+- [ ] Review the Git diff and commit with the actual timestamp
+
+**Verification:** `make clean && make && make test`,
+`./build/test_raft_commit`, and
+`python3 tests/test_commit_integration.py ./build/raft-engine`.
+
+**Boundary:** The quorum calculation is based on acknowledged *volatile* log
+copies. No disk-backed safety or state-machine application is provided. The
+leader's development-only proposal RPC returns before quorum commitment, and
+`lastApplied` remains zero. Phase 15 will address the apply boundary.
+
+**Suggested commit:** `feat: advance raft commit index using majority replication`

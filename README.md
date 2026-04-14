@@ -449,3 +449,53 @@ stronger legacy log/node checks include an invalid-role `"unknown"` contract.
 See `docs/architecture.md` and the separate Phase 13 learning PDF. Next:
 **Phase 14 - majority commit tracking**, including the current-term Raft commit
 rule and explicit separation of acknowledged replication from committed data.
+
+
+## Phase 14: majority-backed commitIndex (fixed three-node cluster)
+
+The elected leader now distinguishes **stored**, **replicated**, and **committed**
+entries. `--propose-demo` still immediately reports admission to the leader's
+memory (its `(uncommitted)` label describes that immediate response, **not** the
+later cluster-wide commit outcome). After a same-term follower AppendEntries
+success, `raft_commit_advance()` considers the leader's own last log index and
+each follower's `matchIndex`. In our three-voter cluster, the *second highest*
+index is the highest replicated on a majority (two nodes).
+
+Crucial Raft rule: the leader advances `commitIndex` **directly only for entries
+from its current term**. Once such an entry reaches a majority, every preceding
+entry (including older-term entries) becomes committed indirectly. No quorum,
+no new commit. On the next heartbeat, the leader advertises the updated
+`leaderCommit`; followers cap their local `commitIndex` to the prefix they have
+actually matched. The leader does not set `lastApplied` yet.
+
+```
+make clean && make && make test
+./build/test_raft_commit
+python3 tests/test_commit_integration.py ./build/raft-engine
+
+# Start each node separately in three terminals:
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+
+# Check roles, then use the actual leader ID (example: 2):
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 "SET alpha 1"
+./build/raft-engine --log-status config/node1.conf 2
+./build/raft-engine --log-status config/node1.conf 3
+```
+
+A successful diagnostic proposal is **not a client acknowledgment of commit**.
+Poll `--log-status` to see `commit_index` progress. The Phase 14 integration test
+starts three TCP processes on temporary loopback ports and verifies: majority
+commit, propagation to followers, two-node quorum with one node down, no
+additional commitment without quorum, and catch-up after rejoining.
+
+**Important limitations:** Everything remains in memory. Restarts lose logs,
+terms, votes and commit progress; this is **not crash-safe Raft**. In
+particular, never infer durability from a majority of volatile copies.
+The development proposal RPC is unauthenticated and must not be exposed outside
+a trusted local lab. No key-value state-machine application (`lastApplied`
+remains zero), snapshots, read consistency, storage layer, production client
+protocol, or generalized membership. These are later milestones. See
+`docs/architecture.md` and the separate Phase 14 learning guide.
