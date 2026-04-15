@@ -7,7 +7,7 @@ LDLIBS ?=
 PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_replicate_client.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
@@ -21,6 +21,7 @@ TEST_RECONCILE = build/test_raft_reconcile
 TEST_REPLICATION = build/test_raft_replication
 TEST_PROGRESS = build/test_raft_progress
 TEST_COMMIT = build/test_raft_commit
+TEST_APPLY = build/test_raft_state_machine
 
 .PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
@@ -64,6 +65,9 @@ $(TEST_PROGRESS): tests/test_raft_progress.c src/raft_replication.c src/raft_app
 $(TEST_COMMIT): tests/test_raft_commit.c src/raft_commit.c src/raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_commit.c src/raft_commit.c src/raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
 
+$(TEST_APPLY): tests/test_raft_state_machine.c src/raft_state_machine.c src/raft_node.c src/raft_log.c src/raft_timer.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_state_machine.c src/raft_state_machine.c src/raft_node.c src/raft_log.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
+
 build:
 	mkdir -p build
 
@@ -83,7 +87,7 @@ check-config: $(APP)
 test-smoke: $(APP)
 	sh tests/test_smoke.sh ./$(APP)
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT)
+test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY)
 	./$(TEST_LOG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
@@ -96,6 +100,7 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_REPLICATION)
 	./$(TEST_PROGRESS)
 	./$(TEST_COMMIT)
+	./$(TEST_APPLY)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -107,6 +112,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_replication_integration.py ./$(APP)
 	$(PYTHON) tests/test_progress_integration.py ./$(APP)
 	$(PYTHON) tests/test_commit_integration.py ./$(APP)
+	$(PYTHON) tests/test_apply_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

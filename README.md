@@ -3,15 +3,55 @@
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 12 / 35 - AppendEntries entry replication over TCP.**
-A fixed three-node cluster can elect a leader and maintain ordinary heartbeat
-stability. Followers now accept bounded, binary-safe batches of log entries
-through AppendEntries, repair conflicting uncommitted suffixes and reject stale
-terms. The `--append-demo` CLI sends a developer-specified request to a running
-node; it is **not** a verified elected-leader proposal or majority commit.
-Persistence, leader progress tracking, automatic catch-up, quorum commits,
-client writes, authentication and a state machine remain future work.
-Run only on a trusted loopback test network.
+**Current milestone: Phase 15 / 35 - Ordered in-memory state-machine application.**
+This three-node demonstration can elect a leader, maintain heartbeats, replicate
+log batches with backtracking, compute majority-backed commits, and now apply
+committed entries in order to a deterministic bounded key-value table.
+The new commands are `SET key value` and `DEL key`. The state machine accepts
+binary values (including NUL) over the existing AppendEntries protocol.
+Only entries through `commitIndex` are visible. A malformed committed command
+is a deterministic no-op but still advances `lastApplied`.
+
+**This is not a production KV service.** The demo proposal RPC returns on log
+admission, not on commitment. Reads are unauthenticated, local, and not
+linearizable. Logs, votes, commits and applied state are ALL volatile: a
+restarted node loses everything until it catches up. Only run on trusted loopback.
+
+### Phase 15 quickstart
+
+```sh
+make clean && make && make test
+# Three separate terminals:
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+# Fourth terminal (example assumes node 2 was elected leader):
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 'SET greeting hello'
+./build/raft-engine --apply-status config/node1.conf 2
+./build/raft-engine --get-demo config/node1.conf 2 greeting
+./build/raft-engine --log-status config/node1.conf 3
+```
+
+For a manual replication demonstration, wait until `last_applied` reaches the
+new proposal index, then inspect the local key on all nodes. A response of
+`accepted=1` is **not** evidence that the new entry is committed.
+
+```sh
+./build/test_raft_state_machine
+python3 tests/test_apply_integration.py ./build/raft-engine
+```
+
+The `--get-demo` output is hexadecimal (`value_hex=`) so embedded NULs are
+unambiguous. Command grammar is exact, case-sensitive and ASCII for keys:
+`SET <key> <value>` or `DEL <key>`. Keys use `[A-Za-z0-9_.-]` with length
+1..64; the value may have 0..1024 bytes, and the key table holds at most 128
+entries. Unsupported or over-limit commands deterministically count as ignored
+entries. An allocation failure stops applying without advancing past the failed
+index; a later AppendEntries or heartbeat retries the pending work.
+
+The older sections below document preceding phases historically; their earlier
+"not implemented yet" scope statements should be read in their phase context.
 
 ## Implemented through Phase 8
 
@@ -64,7 +104,7 @@ make clean
 make
 ```
 
-`make test` runs Phase 1-7 suites. Loopback tests select temporary endpoints,
+`make test` runs Phase 1-15 suites. Loopback tests select temporary endpoints,
 so example ports 7001-7003 do not have to be free.
 
 

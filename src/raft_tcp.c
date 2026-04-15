@@ -7,6 +7,7 @@
 #include "raft_append.h"
 #include "raft_replication.h"
 #include "raft_commit.h"
+#include "raft_state_machine.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -197,7 +198,8 @@ struct tcp_server {
     pthread_cond_t worker_changed;
     tcp_worker_t workers[RAFT_TCP_MAX_WORKERS];
     raft_node_id_t node_id;
-    raft_node_t vote_node; /* Protected by server->mutex. Memory-only Phase 8. */
+    raft_node_t vote_node; /* Protected by server->mutex. */
+    raft_kv_store_t kv;   /* Same mutex, only committed entries are applied. */
     raft_cluster_config_t config; /* Fixed set of allowed candidate IDs. */
     pthread_t election_thread;
     bool election_thread_started;
@@ -263,6 +265,13 @@ static void process_client(int fd, tcp_server_t *server)
         (void)pthread_mutex_lock(&server->mutex);
         raft_status_t result = raft_append_handle_batch(&server->vote_node, &batch, now_ms, &rsp);
         raft_index_t last = raft_log_last_index(&server->vote_node.log);
+        if (result == RAFT_OK && rsp.success) {
+            raft_index_t applied = 0;
+            raft_status_t apply_status = raft_apply_committed(&server->vote_node,
+                                                               &server->kv, &applied);
+            if (apply_status != RAFT_OK)
+                fputs("State-machine application deferred (retry on heartbeat)\n", stderr);
+        }
         (void)pthread_mutex_unlock(&server->mutex);
         if (result != RAFT_OK ||
             raft_append_encode_response(&rsp, output) != RAFT_OK) {
@@ -325,6 +334,50 @@ static void process_client(int fd, tcp_server_t *server)
                 out[i * 8 + b] = (uint8_t)(numbers[i] >> (56u - 8u*b));
         (void)raft_wire_send(fd, RAFT_WIRE_LOG_STATUS_RESPONSE,
                              out, sizeof(out), message, sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_APPLY_STATUS_REQUEST &&
+               length == 0) {
+        /* lastApplied:u64, commitIndex:u64, keyCount:u32, ignored:u64. */
+        uint8_t out[28] = {0};
+        uint64_t applied, committed, ignored;
+        uint32_t keys;
+        (void)pthread_mutex_lock(&server->mutex);
+        applied = server->vote_node.last_applied;
+        committed = server->vote_node.commit_index;
+        keys = (uint32_t)server->kv.count;
+        ignored = server->kv.ignored_commands;
+        (void)pthread_mutex_unlock(&server->mutex);
+        uint64_t numbers[] = {applied, committed, ignored};
+        for (size_t i = 0; i < 2; ++i)
+            for (unsigned b = 0; b < 8; ++b)
+                out[i*8+b] = (uint8_t)(numbers[i] >> (56u-8u*b));
+        for (unsigned b = 0; b < 4; ++b)
+            out[16+b] = (uint8_t)(keys >> (24u-8u*b));
+        for (unsigned b = 0; b < 8; ++b)
+            out[20+b] = (uint8_t)(numbers[2] >> (56u-8u*b));
+        (void)raft_wire_send(fd, RAFT_WIRE_APPLY_STATUS_RESPONSE,
+                             out, sizeof(out), message, sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_DEMO_GET_REQUEST &&
+               raft_kv_valid_key(payload, length)) {
+        /* Local diagnostic read only; cannot provide linearizability. */
+        uint8_t out[11 + RAFT_KV_MAX_VALUE_BYTES] = {0};
+        const uint8_t *value = NULL;
+        size_t value_len = 0;
+        (void)pthread_mutex_lock(&server->mutex);
+        int found = raft_kv_get(&server->kv, payload, length, &value, &value_len);
+        raft_index_t applied = server->vote_node.last_applied;
+        if (found == 1 && value_len <= RAFT_KV_MAX_VALUE_BYTES) {
+            out[0] = 1;
+            out[9] = (uint8_t)(value_len >> 8);
+            out[10] = (uint8_t)value_len;
+            if (value_len) memcpy(out + 11, value, value_len);
+        }
+        for (unsigned b = 0; b < 8; ++b)
+            out[1+b] = (uint8_t)(applied >> (56u-8u*b));
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (found >= 0)
+            (void)raft_wire_send(fd, RAFT_WIRE_DEMO_GET_RESPONSE,
+                                 out, 11 + (out[0] ? value_len : 0),
+                                 message, sizeof(message));
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_STATUS_REQUEST &&
                length == 0) {
         /* Read-only debug status: node_id:u32 term:u64 role:u8 voted_for:u32. */
@@ -376,6 +429,7 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
 {
     memset(server, 0, sizeof(*server));
     server->node_id = node_id;
+    raft_kv_init(&server->kv);
     atomic_init(&server->election_stop, false);
     int code = pthread_mutex_init(&server->mutex, NULL);
     if (code != 0) return code;
@@ -460,6 +514,7 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
             server->workers[i].in_use = false;
         }
     }
+    raft_kv_destroy(&server->kv);
     raft_node_destroy(&server->vote_node);
     (void)pthread_cond_destroy(&server->worker_changed);
     (void)pthread_mutex_destroy(&server->mutex);
@@ -617,6 +672,13 @@ static void *election_worker_main(void *argument)
                                (unsigned long long)new_commit);
                         (void)fflush(stdout);
                     }
+                    /* Application follows commitment, never mere replication.
+                     * OOM retains lastApplied and is retried every heartbeat. */
+                    raft_index_t applied = 0;
+                    raft_status_t apply_status = raft_apply_committed(
+                        &server->vote_node, &server->kv, &applied);
+                    if (apply_status != RAFT_OK)
+                        fputs("Leader state-machine application deferred\n", stderr);
                     if (entries && reply.success) {
                         printf("Replicated: leader=%u follower=%u matchIndex=%llu nextIndex=%llu\n",
                                server->node_id, peer->id,

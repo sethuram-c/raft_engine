@@ -476,3 +476,64 @@ Therefore a majority in the current prototype is NOT a durable quorum.
 Do not use it for data where Raft's real crash-safety guarantees are needed.
 The key-value apply loop, client acknowledgement after commit, durable WAL,
 snapshots and crash recovery are future milestones.
+
+
+## Phase 15: committed state-machine application and diagnostic reads
+
+`include/raft_state_machine.h` / `src/raft_state_machine.c` implement a
+small deterministic in-memory KV state machine. A follower invokes
+`raft_apply_committed()` **after successful AppendEntries**, while the elected
+leader invokes it **after checking majority progress**. Both run under the same
+`server->mutex` protecting the Raft node, log, replication progress and KV
+store; there is no network I/O or blocking allocation while a TCP RPC is in
+flight beyond the short mutex-protected critical section. The leader's
+admission-only development proposal does NOT call apply.
+
+The fundamental ordering invariant is:
+
+```
+0 <= lastApplied <= commitIndex <= lastLogIndex
+for i = lastApplied+1 .. commitIndex (in order):
+    execute log[i] on the KV state machine
+    if processing succeeded: lastApplied = i
+    else: stop and retry later; never mark i applied
+```
+
+The loop is naturally idempotent across repeated heartbeats: if
+`lastApplied == commitIndex`, no commands are run. SET allocates a fresh
+binary-safe value **before** replacing any existing buffer; if allocation
+fails, it leaves both the store and lastApplied unchanged. DEL frees an
+existing value, compacts the bounded key table and treats removal of an
+absent key as successful. Malformed, unsupported and over-limit commands
+have deterministic no-op semantics and increment `ignored_commands` while
+still consuming a committed log index. This policy is a teaching choice; it
+is not a recommendation for a real protocol's error response contract.
+
+New frame types use the existing 12-byte envelope (network byte order):
+
+| Type | Purpose | Payload |
+|---|---|---|
+| 13 | APPLY_STATUS_REQUEST | empty |
+| 14 | APPLY_STATUS_RESPONSE | lastApplied:u64, commit:u64, keyCount:u32, ignored:u64 (28 bytes) |
+| 15 | DEMO_GET_REQUEST | key (1..64 safe ASCII bytes) |
+| 16 | DEMO_GET_RESPONSE | found:u8, lastApplied:u64, valueLen:u16, raw value bytes (11..1035 bytes) |
+
+The `--apply-status` and `--get-demo` CLI commands use these diagnostics.
+A `GET` reads one node's *local* state without a quorum or read-index
+protocol, and can be stale even when it reaches a leader. It is not a
+linearizable read and does not imply durable writes. These unauthenticated
+RPCs must not be exposed on an untrusted network.
+
+**Crash caveat:** a restarted process initializes an empty volatile log and
+empty volatile KV state. Replication repairs the log and replays committed
+entries during catch-up; the state is NOT durable and there is no write-ahead
+log, fsync, snapshot, membership changes, real client API or crash recovery.
+The phrase "majority committed" still means a majority of volatile copies;
+Raft's real persistence safety guarantees are not implemented.
+
+**Verification:** `tests/test_raft_state_machine.c` covers committed gating,
+SET/DEL, binary values, duplicate application, invalid inputs, command limits
+and table-full behavior. `tests/test_apply_integration.py` runs three live
+processes through leader election, committed application, quorum loss,
+recovery, malformed commands and restarted-follower replay. The existing
+Phase 1-14 regression suite remains active.

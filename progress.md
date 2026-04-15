@@ -403,3 +403,36 @@ leader's development-only proposal RPC returns before quorum commitment, and
 `lastApplied` remains zero. Phase 15 will address the apply boundary.
 
 **Suggested commit:** `feat: advance raft commit index using majority replication`
+
+
+## Phase 15 / 35 - Ordered state-machine application (in-memory)
+
+**Planned slot:** January 15, 2027. Use the actual completion time for Git.
+
+### Delivered
+
+- [x] Deterministic bounded `SET key value` / `DEL key` state machine
+- [x] Binary-safe values, strict bounded ASCII key validation
+- [x] Apply only committed log entries, in index order, exactly once
+- [x] Track `lastApplied` as separate from `commitIndex` and `lastLogIndex`
+- [x] Handle empty/unrecognized/over-limit committed commands as no-ops
+- [x] Preserve retry safety on allocation failures before advancing index
+- [x] Apply followers after successful AppendEntries and leaders after quorum checks
+- [x] Synchronize state-machine reads and mutations under server mutex
+- [x] Read-only wire diagnostics and `--apply-status`, `--get-demo` CLI
+- [x] Unit tests for command grammar, binary values, idempotence and limits
+- [x] Three-node TCP integration: commit, no quorum, DEL, recovery, malformed, replay
+- [x] Keep legacy log/node regression tests and `"unknown"` role behavior
+- [ ] Repeat complete suite on personal Fedora machine
+- [ ] Review diff / use current real date for commit
+
+**Verification:** `make clean && make && make test`,
+`./build/test_raft_state_machine`, and
+`python3 tests/test_apply_integration.py ./build/raft-engine`.
+
+**Boundary:** The diagnostic proposal acknowledges mere admission; diagnostic
+GET is not linearizable; neither log nor KV state survives restart without
+replication from still-running nodes. WAL durability, crash recovery and real
+client request/response guarantees remain future phases.
+
+**Suggested commit:** `feat: apply committed raft log entries to in-memory state machine`

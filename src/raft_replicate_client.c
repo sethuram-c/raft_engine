@@ -2,6 +2,7 @@
 #include "raft_append.h"
 #include "raft_tcp.h"
 #include "raft_wire.h"
+#include "raft_state_machine.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -138,4 +139,77 @@ int raft_replicate_client_demo_propose(const raft_cluster_config_t *config,
            peer_id, (unsigned long long)read_u64(reply),
            (unsigned long long)read_u64(reply+8), reply[16]);
     return reply[16] ? 0 : 2;
+}
+
+/* Same short-lived framed TCP connections as the other diagnostic commands. */
+static int request_diagnostic(const raft_cluster_config_t *config,
+                              raft_node_id_t peer_id, raft_wire_type_t request_type,
+                              const void *request, size_t request_length,
+                              raft_wire_type_t expected_type,
+                              uint8_t *response, size_t response_capacity,
+                              size_t *response_length)
+{
+    char error[256];
+    int fd = connect_peer(config, peer_id, error);
+    if (fd < 0) { fprintf(stderr, "Connect failed: %s\n", error); return -1; }
+    raft_wire_status_t status = raft_wire_send(fd, request_type,
+                              request, request_length, error, sizeof(error));
+    raft_wire_type_t actual_type = 0;
+    if (status == RAFT_WIRE_OK)
+        status = raft_wire_recv(fd, &actual_type, response, response_capacity,
+                                response_length, error, sizeof(error));
+    (void)close(fd);
+    if (status != RAFT_WIRE_OK || actual_type != expected_type) {
+        fprintf(stderr, "Diagnostic request failed: %s\n",
+                status == RAFT_WIRE_OK ? "wrong reply type" : error);
+        return -1;
+    }
+    return 0;
+}
+
+int raft_replicate_client_apply_status(const raft_cluster_config_t *config,
+                                       raft_node_id_t peer_id)
+{
+    if (config == NULL) return -1;
+    uint8_t response[28];
+    size_t length = 0;
+    if (request_diagnostic(config, peer_id, RAFT_WIRE_APPLY_STATUS_REQUEST,
+                           NULL, 0, RAFT_WIRE_APPLY_STATUS_RESPONSE,
+                           response, sizeof(response), &length) != 0 ||
+        length != sizeof(response)) return -1;
+    uint32_t keys = ((uint32_t)response[16] << 24) |
+                    ((uint32_t)response[17] << 16) |
+                    ((uint32_t)response[18] << 8) | response[19];
+    printf("Apply status: peer=%u last_applied=%llu commit_index=%llu keys=%u ignored=%llu\n",
+           peer_id, (unsigned long long)read_u64(response),
+           (unsigned long long)read_u64(response+8), keys,
+           (unsigned long long)read_u64(response+20));
+    return 0;
+}
+
+int raft_replicate_client_demo_get(const raft_cluster_config_t *config,
+                                   raft_node_id_t peer_id,
+                                   const uint8_t *key, size_t key_len)
+{
+    if (config == NULL || !raft_kv_valid_key(key, key_len)) return -1;
+    uint8_t response[11 + RAFT_KV_MAX_VALUE_BYTES];
+    size_t length = 0;
+    if (request_diagnostic(config, peer_id, RAFT_WIRE_DEMO_GET_REQUEST,
+                           key, key_len, RAFT_WIRE_DEMO_GET_RESPONSE,
+                           response, sizeof(response), &length) != 0 ||
+        length < 11 || response[0] > 1) return -1;
+    size_t value_len = ((size_t)response[9] << 8) | response[10];
+    if (value_len > RAFT_KV_MAX_VALUE_BYTES ||
+        length != 11 + (response[0] ? value_len : 0) ||
+        (!response[0] && value_len != 0)) return -1;
+    printf("Local key read: peer=%u key=%.*s found=%u last_applied=%llu",
+           peer_id, (int)key_len, (const char *)key, response[0],
+           (unsigned long long)read_u64(response+1));
+    if (response[0]) {
+        printf(" value_hex=");
+        for (size_t i = 0; i < value_len; ++i) printf("%02x", response[11+i]);
+    }
+    putchar('\n');
+    puts("Diagnostic only: local read, no leader/lease or linearizability guarantee.");
+    return 0;
 }

@@ -15,4 +15,10 @@ int raft_replicate_client_demo_propose(const raft_cluster_config_t *config,
                                        const uint8_t *command, size_t len);
 int raft_replicate_client_log_status(const raft_cluster_config_t *config,
                                     raft_node_id_t peer_id);
+/* Unauthenticated diagnostics: local state, NOT linearizable reads. */
+int raft_replicate_client_apply_status(const raft_cluster_config_t *config,
+                                       raft_node_id_t peer_id);
+int raft_replicate_client_demo_get(const raft_cluster_config_t *config,
+                                   raft_node_id_t peer_id,
+                                   const uint8_t *key, size_t key_len);
 #endif

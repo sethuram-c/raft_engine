@@ -434,6 +434,27 @@ static int propose_demo_peer(const char *path, const char *peer_text,
               (const uint8_t *)command, len) == 0 ? 0 : 1;
 }
 
+static int apply_status_peer(const char *path, const char *peer_text)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    uint64_t peer;
+    if (parse_decimal_u64(peer_text, &peer) != 0 || peer == 0 ||
+        peer > UINT32_MAX) return 1;
+    return raft_replicate_client_apply_status(&config, (raft_node_id_t)peer) == 0 ? 0 : 1;
+}
+
+static int get_demo_peer(const char *path, const char *peer_text, const char *key)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    uint64_t peer;
+    if (parse_decimal_u64(peer_text, &peer) != 0 || peer == 0 ||
+        peer > UINT32_MAX) return 1;
+    return raft_replicate_client_demo_get(&config, (raft_node_id_t)peer,
+            (const uint8_t *)key, strlen(key)) == 0 ? 0 : 1;
+}
+
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
@@ -441,7 +462,8 @@ static void usage(void)
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
-          "--log-status PATH PEER_ID | --propose-demo PATH LEADER_ID COMMAND]\n", stderr);
+          "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -488,6 +510,10 @@ int main(int argc, char **argv)
         return append_demo_peer(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
     if (argc == 4 && strcmp(argv[1], "--log-status") == 0)
         return log_status_peer(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--apply-status") == 0)
+        return apply_status_peer(argv[2], argv[3]);
+    if (argc == 5 && strcmp(argv[1], "--get-demo") == 0)
+        return get_demo_peer(argv[2], argv[3], argv[4]);
     if (argc == 5 && strcmp(argv[1], "--propose-demo") == 0)
         return propose_demo_peer(argv[2], argv[3], argv[4]);
     usage();
