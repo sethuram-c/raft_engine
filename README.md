@@ -1,9 +1,76 @@
 # Raft Engine
 
+A learning-oriented C11 distributed key-value store for Fedora Linux.
+
+**Current milestone: Phase 16 / 35 — Durable Raft term, vote, log and commit
+metadata groundwork.** The new opt-in `--elect-durable` mode restores local
+consensus state after process crash; `--elect` remains volatile. The disk image
+is versioned, checksummed, size-bounded and replaced with a temp-file fsync,
+atomic rename, and directory fsync. Each durable node holds an advisory
+per-node storage lock. Restart always begins as follower and deterministically
+replays the committed prefix into a new KV state machine.
+
+### Phase 16 Fedora quickstart
+
+```sh
+make clean && make && make test
+# In three separate terminals (same directory; different node IDs):
+./build/raft-engine --elect-durable config/node1.conf data
+./build/raft-engine --elect-durable config/node2.conf data
+./build/raft-engine --elect-durable config/node3.conf data
+# Identify the leader, then replace ID 2 below with that leader:
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 'SET greeting hello'
+./build/raft-engine --get-demo config/node1.conf 2 greeting
+
+# Focused durability tests:
+./build/test_raft_storage
+python3 tests/test_storage_integration.py ./build/raft-engine
+```
+
+**Warning:** The development-only proposal returns on admission, NOT on
+commit. Diagnostic GET is local and not linearizable; neither RPC is
+authenticated. The stored snapshot is a full log rewrite, NOT a WAL or a
+production database. Only run on trusted loopback. Do not wipe and reuse a
+previously participating node's durable data to simulate safe replacement.
+
+
+### Durable mode: what is and is not guaranteed
+
+- One node's storage files are `data/node-ID.raft` and `data/node-ID.lock`.
+  `data/` is excluded by `.gitignore`; use a separate directory outside Git
+  if desired. The directory is created with 0700 and new files with 0600.
+- Durable state changes are written before granting a new vote, sending a
+  self-vote request, acknowledging a new AppendEntries log, or acknowledging
+  an admitted diagnostic proposal. Commit advancement is also saved.
+- A full state image is serialized in network byte order (not raw C structs)
+  with format version, node ID, term, vote, commit index, log entries and CRC32.
+  Temporary-file `fsync`, rename, and directory `fsync` make each update
+  crash-atomic on local filesystems that honor those durability operations.
+- The reader rejects malformed/truncated/corrupt files and wrong node IDs; it
+  does not silently bootstrap after such a failure. A per-node advisory lock
+  rejects duplicate processes using the same data directory and node ID.
+- Recovery always returns as a follower, resets the election deadline, and
+  rebuilds the KV state deterministically from entries through `commitIndex`.
+  `lastApplied` and the KV contents are reconstructed, not stored separately.
+- Per-peer `nextIndex` / `matchIndex`, role, sockets and timer deadlines are
+  volatile. There is no WAL, compaction, snapshot installation, authentication,
+  configuration-change protocol, linearizable GET, or full crash-proof testing.
+- Limits: 4 MiB snapshot, 4096 log entries, 4096 bytes per command. Once full,
+  a durable write fails closed. Full-snapshot fsync is intentionally expensive.
+- **Do not delete a node's durable file and restart that same voting identity.**
+  This learning demo has no protocol for safe node replacement.
+
+
+
+---
+
+## Historical notes through Phase 15
+
 A learning-oriented distributed key-value store under construction in **C11**
 on **Fedora Linux**, using **GNU Make** and a fixed three-node configuration.
 
-**Current milestone: Phase 15 / 35 - Ordered in-memory state-machine application.**
+**Historical milestone: Phase 15 / 35 - Ordered in-memory state-machine application.**
 This three-node demonstration can elect a leader, maintain heartbeats, replicate
 log batches with backtracking, compute majority-backed commits, and now apply
 committed entries in order to a deterministic bounded key-value table.

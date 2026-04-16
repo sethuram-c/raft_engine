@@ -145,11 +145,14 @@ def main(binary):
             all_logs = [log(n) for n in (1, 2, 3)]
             assert all(x is not None and x[0] == 2 and x[2] == 2 for x in all_logs), all_logs
             print('PASS: restarted, empty follower catches up using nextIndex retries and receives commit')
-            ans = proposed(leader, b'SET gamma 3')
-            assert ans == (term, 3, 1), ans
+            # A restarted follower can legitimately win a later election.
+            # Do not require the *original* leader/term to survive the restart;
+            # require a current majority-backed leader for the next proposal.
+            current_leader, current_term = wait_for(stable, 12)
+            ans = proposed(current_leader, b'SET gamma 3')
+            assert ans == (current_term, 3, 1), ans
             wait_for(lambda: all(log(n) and log(n)[0] == 3 and log(n)[2] == 3
-                                 for n in (1, 2, 3)))
-            assert stable() == (leader, term)
+                                 for n in (1, 2, 3)), 12)
             print('PASS: subsequent replication and majority-based commitment remain healthy')
         except Exception:
             for f in logs:

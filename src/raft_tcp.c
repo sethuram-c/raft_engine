@@ -8,6 +8,7 @@
 #include "raft_replication.h"
 #include "raft_commit.h"
 #include "raft_state_machine.h"
+#include "raft_storage.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -205,7 +206,27 @@ struct tcp_server {
     bool election_thread_started;
     atomic_bool election_stop;
     raft_replication_progress_t progress[RAFT_ELECTION_CLUSTER_SIZE];
+    raft_storage_t storage;
+    bool durable;
+    bool storage_failed; /* Read by accept thread only after joining workers. */
 };
+
+/* Caller holds server->mutex. Persistence must complete BEFORE any vote,
+ * append or proposal acknowledgement or outbound vote for a new term.
+ * A write failure is fail-stop: no unrecorded consensus decision is exposed. */
+static int durable_checkpoint(tcp_server_t *server)
+{
+    if (!server->durable) return 0;
+    char error[256];
+    if (raft_storage_save(&server->storage, &server->vote_node,
+                          error, sizeof(error)) == 0) return 0;
+    fprintf(stderr, "FATAL durable storage failure, halting: %s\n", error);
+    server->storage_failed = true;
+    atomic_store(&server->election_stop, true);
+    stop_requested = 1;
+    return -1;
+}
+
 
 static void process_client(int fd, tcp_server_t *server)
 {
@@ -235,7 +256,14 @@ static void process_client(int fd, tcp_server_t *server)
             return;
         }
         (void)pthread_mutex_lock(&server->mutex);
+        raft_term_t old_term = server->vote_node.current_term;
+        raft_node_id_t old_vote = server->vote_node.voted_for;
         raft_status_t result = raft_vote_handle(&server->vote_node, &req, now_ms, &rsp);
+        if (result == RAFT_OK &&
+            (old_term != server->vote_node.current_term ||
+             old_vote != server->vote_node.voted_for) &&
+            durable_checkpoint(server) != 0)
+            result = RAFT_ERR_INVALID_ARGUMENT;
         (void)pthread_mutex_unlock(&server->mutex);
         if (result != RAFT_OK ||
             raft_vote_encode_response(&rsp, output) != RAFT_OK) {
@@ -263,6 +291,9 @@ static void process_client(int fd, tcp_server_t *server)
             return;
         }
         (void)pthread_mutex_lock(&server->mutex);
+        raft_term_t old_term = server->vote_node.current_term;
+        raft_node_id_t old_vote = server->vote_node.voted_for;
+        raft_index_t old_commit = server->vote_node.commit_index;
         raft_status_t result = raft_append_handle_batch(&server->vote_node, &batch, now_ms, &rsp);
         raft_index_t last = raft_log_last_index(&server->vote_node.log);
         if (result == RAFT_OK && rsp.success) {
@@ -272,6 +303,12 @@ static void process_client(int fd, tcp_server_t *server)
             if (apply_status != RAFT_OK)
                 fputs("State-machine application deferred (retry on heartbeat)\n", stderr);
         }
+        if (result == RAFT_OK &&
+            (batch.entry_count != 0 || old_term != server->vote_node.current_term ||
+             old_vote != server->vote_node.voted_for ||
+             old_commit != server->vote_node.commit_index) &&
+            durable_checkpoint(server) != 0)
+            result = RAFT_ERR_INVALID_ARGUMENT;
         (void)pthread_mutex_unlock(&server->mutex);
         if (result != RAFT_OK ||
             raft_append_encode_response(&rsp, output) != RAFT_OK) {
@@ -302,6 +339,10 @@ static void process_client(int fd, tcp_server_t *server)
             raft_log_append(&node->log, term, payload, length) == RAFT_OK) {
             accepted = 1;
             index = raft_log_last_index(&node->log);
+            if (durable_checkpoint(server) != 0) {
+                accepted = 0;
+                index = 0;
+            }
         }
         (void)pthread_mutex_unlock(&server->mutex);
         for (unsigned b = 0; b < 8; ++b) {
@@ -431,6 +472,8 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     server->node_id = node_id;
     raft_kv_init(&server->kv);
     atomic_init(&server->election_stop, false);
+    server->storage.directory_fd = -1;
+    server->storage.lock_fd = -1;
     int code = pthread_mutex_init(&server->mutex, NULL);
     if (code != 0) return code;
     code = pthread_cond_init(&server->worker_changed, NULL);
@@ -514,6 +557,7 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
             server->workers[i].in_use = false;
         }
     }
+    raft_storage_close(&server->storage);
     raft_kv_destroy(&server->kv);
     raft_node_destroy(&server->vote_node);
     (void)pthread_cond_destroy(&server->worker_changed);
@@ -609,8 +653,8 @@ static void *election_worker_main(void *argument)
             (void)raft_log_term_at(&node->log, index, &log_term);
             request = (raft_vote_request_t){node->current_term, node->id,
                                             index, log_term};
-            begin = true;
-            printf("Election started: node=%u term=%llu self_votes=1\n",
+            begin = durable_checkpoint(server) == 0;
+            if (begin) printf("Election started: node=%u term=%llu self_votes=1\n",
                    node->id, (unsigned long long)node->current_term);
             (void)fflush(stdout);
         }
@@ -647,6 +691,8 @@ static void *election_worker_main(void *argument)
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
                 raft_role_t old = server->vote_node.role;
+                raft_term_t old_term = server->vote_node.current_term;
+                raft_index_t old_commit = server->vote_node.commit_index;
                 (void)raft_append_handle_response(&server->vote_node, &reply, now);
                 bool still_leader = server->vote_node.role == RAFT_LEADER &&
                     server->vote_node.current_term == heartbeat_term;
@@ -692,6 +738,9 @@ static void *election_worker_main(void *argument)
                            (unsigned long long)server->vote_node.current_term);
                     (void)fflush(stdout);
                 }
+                if ((server->vote_node.current_term != old_term ||
+                     server->vote_node.commit_index != old_commit) &&
+                    durable_checkpoint(server) != 0) still_leader = false;
                 (void)pthread_mutex_unlock(&server->mutex);
                 if (!still_leader) break;
             }
@@ -706,6 +755,8 @@ static void *election_worker_main(void *argument)
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
                 raft_role_t previous = server->vote_node.role;
+                raft_term_t old_term = server->vote_node.current_term;
+                raft_node_id_t old_vote = server->vote_node.voted_for;
                 (void)raft_election_record(&server->vote_node, &round,
                                             peer->id, &reply, now);
                 if (previous == RAFT_CANDIDATE &&
@@ -726,6 +777,9 @@ static void *election_worker_main(void *argument)
                 }
                 bool continuing = server->vote_node.role == RAFT_CANDIDATE &&
                                   server->vote_node.current_term == round.term;
+                if ((server->vote_node.current_term != old_term ||
+                     server->vote_node.voted_for != old_vote) &&
+                    durable_checkpoint(server) != 0) continuing = false;
                 (void)pthread_mutex_unlock(&server->mutex);
                 if (!continuing) break;
             }
@@ -737,6 +791,7 @@ static void *election_worker_main(void *argument)
 
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
+                          const char *durable_directory,
                           char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
@@ -753,6 +808,42 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
         (void)close(listener);
         return -1;
+    }
+    if (durable_directory != NULL) {
+        if (raft_storage_open(&server.storage, durable_directory, config->node_id,
+                              error, error_capacity) != 0) {
+            (void)close(listener);
+            stop_and_join_workers(&server, false);
+            return -1;
+        }
+        server.durable = true;
+        int found = 0;
+        if (raft_storage_load(&server.storage, &server.vote_node, &found,
+                              error, error_capacity) != 0) {
+            (void)close(listener);
+            stop_and_join_workers(&server, false);
+            return -1; /* corrupt durable state must NOT be replaced */
+        }
+        uint64_t now = 0;
+        raft_index_t replayed = 0;
+        if (raft_clock_monotonic_ms(&now) != RAFT_OK ||
+            raft_node_start_follower(&server.vote_node, now,
+                     0x9E3779B9u ^ config->node_id ^ (uint32_t)getpid() ^ (uint32_t)now) != RAFT_OK ||
+            raft_apply_committed(&server.vote_node, &server.kv, &replayed) != RAFT_OK ||
+            (!found && raft_storage_save(&server.storage, &server.vote_node,
+                                         error, error_capacity) != 0)) {
+            if (error && error_capacity && error[0] == '\0')
+                report_error(error, error_capacity, "could not restore durable state");
+            (void)close(listener);
+            stop_and_join_workers(&server, false);
+            return -1;
+        }
+        printf("Durable recovery: node=%u restored=%d term=%llu log=%llu commit=%llu\n",
+               config->node_id, found,
+               (unsigned long long)server.vote_node.current_term,
+               (unsigned long long)raft_log_last_index(&server.vote_node.log),
+               (unsigned long long)server.vote_node.commit_index);
+        (void)fflush(stdout);
     }
 
     struct sigaction action;
@@ -860,6 +951,10 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
     /* On a signal or fatal error abort stalled clients; at max_connections,
      * drain all accepted requests before exiting normally. */
     stop_and_join_workers(&server, stop_requested != 0 || result != 0);
+    if (server.storage_failed) {
+        report_error(error, error_capacity, "fatal durable storage failure; node stopped");
+        result = -1;
+    }
     (void)sigaction(SIGTERM, &previous_term, NULL);
     (void)sigaction(SIGINT, &previous_int, NULL);
     if (result == 0) {
@@ -874,11 +969,21 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, error, error_capacity);
+}
+
+int raft_tcp_elect_durable(const raft_cluster_config_t *config,
+                           const char *directory, char *error, size_t capacity)
+{
+    if (!directory || !*directory) {
+        report_error(error, capacity, "durable directory is required");
+        return -1;
+    }
+    return tcp_serve_mode(config, 0, true, directory, error, capacity);
 }

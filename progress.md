@@ -436,3 +436,36 @@ replication from still-running nodes. WAL durability, crash recovery and real
 client request/response guarantees remain future phases.
 
 **Suggested commit:** `feat: apply committed raft log entries to in-memory state machine`
+
+
+## Phase 16 / 35 - Durable term/vote and log snapshot groundwork
+
+**Planned slot:** January 16, 2027. Use the actual date of your commit.
+
+- [x] Versioned, portable big-endian metadata + ordered binary log format
+- [x] CRC32 integrity detection; strict bounds and consistency validation
+- [x] Per-node exclusive advisory lock to prevent overlapping writers
+- [x] Temporary file, `fsync(file)`, `renameat`, `fsync(directory)`
+- [x] Persist self-vote before RequestVote, and vote grants before acknowledgement
+- [x] Persist leader proposals and follower log reconciliation before ACK
+- [x] Persist term adoption and majority commit advancement
+- [x] Fail-stop on persistence errors rather than serving unrecorded state
+- [x] Opt-in `--elect-durable CONFIG DATA_DIR` leaving `--elect` unchanged
+- [x] Recovery validates node ID/term/vote/log/commit, resets follower timeout
+- [x] Deterministically rebuild KV from persisted committed log on startup
+- [x] Unit tests for binary recovery, locks, CRC, truncation and replacement
+- [x] Three-process SIGKILL / restart / quorum / corruption integration test
+- [x] Preserve legacy log/node tests and prior consensus features
+- [ ] Test with controlled power-loss, ENOSPC and hardware write barriers
+- [ ] Run on personal Fedora machine and commit with the real timestamp
+
+**Commands:** `make clean && make && make test`;
+`./build/test_raft_storage`;
+`python3 tests/test_storage_integration.py ./build/raft-engine`.
+
+**Boundaries:** Full-state snapshots are O(size of log) per mutation; not a WAL.
+Durability requires a filesystem that honors fsync/rename semantics, not NFS.
+There is no safe node replacement, authenticated client API, linearizable
+read, background compaction, snapshot installation, or membership change.
+
+**Suggested commit:** `feat: persist raft term vote log and committed state atomically`

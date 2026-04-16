@@ -537,3 +537,62 @@ and table-full behavior. `tests/test_apply_integration.py` runs three live
 processes through leader election, committed application, quorum loss,
 recovery, malformed commands and restarted-follower replay. The existing
 Phase 1-14 regression suite remains active.
+
+
+## Phase 16 - Durable election and log recovery (opt-in)
+
+```text
+                     --elect-durable CONFIG DATA_DIR
+                                   |
+                         raft_storage_open()
+                                   |  advisory flock node-ID.lock
+                         raft_storage_load()
+                                   |  strict magic/version/node/CRC/bounds
+                          term, vote, log, commit
+                                   |
+                        follower timer reset
+                                   |
+                         apply committed prefix
+                                   |
+                            network listeners
+
+ consensus event -- node mutex --> node updated
+                                |
+                       raft_storage_save()
+                                |  serialize BE + CRC32
+                  write temp --> fsync(temp) --> rename
+                                |                     
+                       fsync(directory)
+                                |
+                 unlock / send ACK or RequestVote
+```
+
+The portable on-disk bytes are:
+
+```text
+0..7   magic ASCII "RAFT16DB"
+8..11  version u32 BE (1)
+12..15 node id u32 BE
+16..23 current term u64 BE
+24..27 voted for u32 BE (0 means none)
+28..35 commit index u64 BE
+36..39 entry count u32 BE
+then for each entry: term u64 BE, command length u32 BE, raw command bytes
+last 4 bytes CRC32 IEEE covering everything preceding the CRC
+```
+
+Only the durable mode calls storage hooks. Every mutation that can affect a
+peer-visible consensus decision is checkpointed before its associated RPC
+response or subsequent request. Ordinary heartbeats with unchanged metadata
+do not rewrite files. Disk failure requests fail-stop behavior; a file already
+renamed but without successful directory fsync may or may not survive power
+loss, so the process does not continue on that ambiguity.
+
+The snapshot does not contain role (always restart FOLLOWER), leader peer
+progress, KV contents, or `lastApplied` (replay through commit index). The
+committed prefix is replayed with `raft_apply_committed` before accepting TCP
+connections. Corrupt files are rejected, never overwritten with empty state.
+
+This is an educational atomic image, not an append-only write-ahead log. It
+can become expensive with large logs, has a deliberately strict 4 MiB cap, and
+does not handle safe replacement of a lost node identity or linearizable reads.

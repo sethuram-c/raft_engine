@@ -42,4 +42,9 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity);
 
+/* Opt-in durability; preserves term, voted_for, log and commitIndex.
+ * On startup, validates CRC and replays committed entries into the KV store. */
+int raft_tcp_elect_durable(const raft_cluster_config_t *config,
+                           const char *directory, char *error, size_t capacity);
+
 #endif /* RAFT_TCP_H */

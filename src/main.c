@@ -123,6 +123,18 @@ static int elect_server(const char *path)
     return 0;
 }
 
+static int elect_durable_server(const char *path, const char *directory)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    char error[256] = {0};
+    if (raft_tcp_elect_durable(&config, directory, error, sizeof(error)) != 0) {
+        fprintf(stderr, "Durable election server failed: %s\n", error);
+        return 1;
+    }
+    return 0;
+}
+
 static int status_peer(const char *path, const char *peer_text)
 {
     raft_cluster_config_t config;
@@ -458,7 +470,7 @@ static int get_demo_peer(const char *path, const char *peer_text, const char *ke
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --status PATH PEER_ID | --probe PATH PEER_ID | "
+          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
@@ -484,6 +496,8 @@ int main(int argc, char **argv)
         return check_config(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--elect") == 0)
         return elect_server(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "--elect-durable") == 0)
+        return elect_durable_server(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--status") == 0)
         return status_peer(argv[2], argv[3]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)
