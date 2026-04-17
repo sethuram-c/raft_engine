@@ -469,3 +469,55 @@ There is no safe node replacement, authenticated client API, linearizable
 read, background compaction, snapshot installation, or membership change.
 
 **Suggested commit:** `feat: persist raft term vote log and committed state atomically`
+
+
+## Phase 17 / 35 — Append-only Write-Ahead Log & Incremental Recovery
+
+**Time budget:** ~2 hours (planned Jan 17, 2027; record actual commit time)
+
+### Deliverable
+
+A separate opt-in WAL-backed three-node mode that writes term/vote/commit
+changes and only newly appended or replaced log suffixes, never rewriting the
+whole existing log on each update. Recovery replays a bounded, validated
+sequence of durable records and reconstructs the KV state from committed logs.
+
+### Acceptance checks
+
+- [x] `--elect-wal CONFIG DATA_DIR` with shared per-node advisory locks
+- [x] Format-versioned, node-bound, CRC32-protected WAL header
+- [x] Length/CRC-framed records with strictly increasing sequence numbers
+- [x] Metadata-only updates and prefix+suffix log edits, binary-safe commands
+- [x] `fsync` record before vote/AppendEntries/proposal/commit acknowledgement
+- [x] Replay retains committed log prefix and term/vote/commit monotonicity
+- [x] Torn *final* record is truncated and fsynced; complete corruption fails
+- [x] Same node/data directory cannot mix Phase 16 snapshot and Phase 17 WAL
+- [x] Uncommitted suffix preserved but invisible after abrupt process restart
+- [x] Dedicated C tests and three-process SIGKILL, tail and CRC tests
+- [x] Targeted Clang ASan/UBSan unit and integration tests
+- [ ] Run all tests on your own Fedora machine and review Git diff
+- [ ] Commit with the actual date when you are satisfied
+
+### Verify
+
+```sh
+make clean && make && make test
+./build/test_raft_wal
+python3 tests/test_wal_integration.py ./build/raft-engine
+```
+
+### Git commit
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+    include/raft_wal.h include/raft_tcp.h \
+    src/raft_wal.c src/raft_storage.c src/raft_tcp.c src/main.c \
+    tests/test_raft_wal.c tests/test_wal_integration.py
+git diff --cached --check
+git commit -m "feat: add incremental raft WAL and crash-safe journal replay"
+```
+
+**Scope limits:** No compaction or log snapshots installed from leader;
+64 MiB WAL cap; no online migration from Phase 16; no client linearizability.
+
+**Next Phase 18:** WAL compaction / checkpoint creation and bounding replay time.

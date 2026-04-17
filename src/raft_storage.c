@@ -212,6 +212,16 @@ int raft_storage_load(raft_storage_t *store, raft_node_t *node, int *found,
         return -1;
     }
     *found = 0;
+    /* Refuse a WAL from the same voting identity rather than silently
+     * starting an independent Phase 16 history in this directory. */
+    char wal_name[48];
+    (void)snprintf(wal_name,sizeof(wal_name),"node-%" PRIu32 ".wal",store->id);
+    struct stat wal_stat;
+    if (fstatat(store->directory_fd,wal_name,&wal_stat,AT_SYMLINK_NOFOLLOW)==0 ||
+        errno!=ENOENT) {
+        errout(error,cap,"WAL exists (or cannot be checked); use a separate Phase 16 directory");
+        return -1;
+    }
     int fd = openat(store->directory_fd, store->data_name,
                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {

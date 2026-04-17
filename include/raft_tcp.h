@@ -47,4 +47,8 @@ int raft_tcp_elect(const raft_cluster_config_t *config,
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
                            const char *directory, char *error, size_t capacity);
 
+/* Phase 17 opt-in incremental write-ahead log, exclusive of Phase 16 image. */
+int raft_tcp_elect_wal(const raft_cluster_config_t *config,
+                       const char *directory, char *error, size_t capacity);
+
 #endif /* RAFT_TCP_H */

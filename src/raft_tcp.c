@@ -9,6 +9,7 @@
 #include "raft_commit.h"
 #include "raft_state_machine.h"
 #include "raft_storage.h"
+#include "raft_wal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -207,7 +208,9 @@ struct tcp_server {
     atomic_bool election_stop;
     raft_replication_progress_t progress[RAFT_ELECTION_CLUSTER_SIZE];
     raft_storage_t storage;
+    raft_wal_t wal;
     bool durable;
+    bool journal;
     bool storage_failed; /* Read by accept thread only after joining workers. */
 };
 
@@ -216,10 +219,12 @@ struct tcp_server {
  * A write failure is fail-stop: no unrecorded consensus decision is exposed. */
 static int durable_checkpoint(tcp_server_t *server)
 {
-    if (!server->durable) return 0;
+    if (!server->durable && !server->journal) return 0;
     char error[256];
-    if (raft_storage_save(&server->storage, &server->vote_node,
-                          error, sizeof(error)) == 0) return 0;
+    if ((server->journal ? raft_wal_save(&server->wal, &server->vote_node,
+                              error, sizeof(error)) :
+             raft_storage_save(&server->storage, &server->vote_node,
+                              error, sizeof(error))) == 0) return 0;
     fprintf(stderr, "FATAL durable storage failure, halting: %s\n", error);
     server->storage_failed = true;
     atomic_store(&server->election_stop, true);
@@ -474,6 +479,9 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     atomic_init(&server->election_stop, false);
     server->storage.directory_fd = -1;
     server->storage.lock_fd = -1;
+    server->wal.fd = -1;
+    server->wal.lock.directory_fd = -1;
+    server->wal.lock.lock_fd = -1;
     int code = pthread_mutex_init(&server->mutex, NULL);
     if (code != 0) return code;
     code = pthread_cond_init(&server->worker_changed, NULL);
@@ -557,6 +565,7 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
             server->workers[i].in_use = false;
         }
     }
+    if (server->journal) raft_wal_close(&server->wal);
     raft_storage_close(&server->storage);
     raft_kv_destroy(&server->kv);
     raft_node_destroy(&server->vote_node);
@@ -791,7 +800,7 @@ static void *election_worker_main(void *argument)
 
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
-                          const char *durable_directory,
+                          const char *durable_directory, bool journal,
                           char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
@@ -810,16 +819,27 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         return -1;
     }
     if (durable_directory != NULL) {
-        if (raft_storage_open(&server.storage, durable_directory, config->node_id,
+        if (journal) {
+            if (raft_wal_open(&server.wal,durable_directory,config->node_id,
+                              error,error_capacity)!=0) {
+                (void)close(listener);
+                stop_and_join_workers(&server,false);
+                return -1;
+            }
+            server.journal=true;
+        }
+        if (!journal && raft_storage_open(&server.storage, durable_directory, config->node_id,
                               error, error_capacity) != 0) {
             (void)close(listener);
             stop_and_join_workers(&server, false);
             return -1;
         }
-        server.durable = true;
+        server.durable = !journal;
         int found = 0;
-        if (raft_storage_load(&server.storage, &server.vote_node, &found,
-                              error, error_capacity) != 0) {
+        if ((journal ? raft_wal_load(&server.wal,&server.vote_node,&found,
+                                    error,error_capacity) :
+             raft_storage_load(&server.storage, &server.vote_node, &found,
+                              error, error_capacity)) != 0) {
             (void)close(listener);
             stop_and_join_workers(&server, false);
             return -1; /* corrupt durable state must NOT be replaced */
@@ -830,7 +850,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             raft_node_start_follower(&server.vote_node, now,
                      0x9E3779B9u ^ config->node_id ^ (uint32_t)getpid() ^ (uint32_t)now) != RAFT_OK ||
             raft_apply_committed(&server.vote_node, &server.kv, &replayed) != RAFT_OK ||
-            (!found && raft_storage_save(&server.storage, &server.vote_node,
+            (!found && !journal && raft_storage_save(&server.storage, &server.vote_node,
                                          error, error_capacity) != 0)) {
             if (error && error_capacity && error[0] == '\0')
                 report_error(error, error_capacity, "could not restore durable state");
@@ -838,7 +858,8 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             stop_and_join_workers(&server, false);
             return -1;
         }
-        printf("Durable recovery: node=%u restored=%d term=%llu log=%llu commit=%llu\n",
+        printf("%s recovery: node=%u restored=%d term=%llu log=%llu commit=%llu\n",
+               journal ? "WAL" : "Durable",
                config->node_id, found,
                (unsigned long long)server.vote_node.current_term,
                (unsigned long long)raft_log_last_index(&server.vote_node.log),
@@ -969,13 +990,13 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, NULL, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, false, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, NULL, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, false, error, error_capacity);
 }
 
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
@@ -985,5 +1006,15 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
         report_error(error, capacity, "durable directory is required");
         return -1;
     }
-    return tcp_serve_mode(config, 0, true, directory, error, capacity);
+    return tcp_serve_mode(config, 0, true, directory, false, error, capacity);
+}
+
+int raft_tcp_elect_wal(const raft_cluster_config_t *config,
+                       const char *directory, char *error, size_t capacity)
+{
+    if (!directory || !*directory) {
+        report_error(error,capacity,"WAL directory is required");
+        return -1;
+    }
+    return tcp_serve_mode(config,0,true,directory,true,error,capacity);
 }

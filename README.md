@@ -1,5 +1,67 @@
 # Raft Engine
 
+A learning-oriented C11 Raft/key-value engine for Fedora Linux.
+
+**Current milestone: Phase 17 / 35 — Append-only Write-Ahead Log (WAL) and incremental replay.**
+The new `--elect-wal` mode persists incremental changes to term, vote, commit
+index, and changed log suffixes in checksummed, length-framed journal records.
+The record is appended and `fsync`ed before a consensus acknowledgement.
+After `SIGKILL`, startup replays the verified records in sequence, truncates
+*only an incomplete final record* and rebuilds committed KV state. A complete
+record with an invalid CRC, sequence, term, or log transition fails closed.
+
+### Phase 17 quickstart
+
+```sh
+make clean && make && make test
+# Three distinct terminals, SAME data directory, DIFFERENT node identities:
+./build/raft-engine --elect-wal config/node1.conf data
+./build/raft-engine --elect-wal config/node2.conf data
+./build/raft-engine --elect-wal config/node3.conf data
+# Find leader, then use its ID (e.g. 2) in local diagnostic commands:
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 'SET greeting hello'
+./build/raft-engine --apply-status config/node1.conf 2
+./build/raft-engine --get-demo config/node1.conf 2 greeting
+
+# Focused Phase 17 tests:
+./build/test_raft_wal
+python3 tests/test_wal_integration.py ./build/raft-engine
+```
+
+**Disk layout:** `data/node-ID.wal` and `data/node-ID.lock`. The data
+file begins with a 20-byte versioned/CRC-protected header and then append-only
+records (8-byte length/CRC frame plus metadata/changed log suffix). Per-node
+`flock` prevents two live writers. The journal is limited to 64 MiB, and the
+in-memory log remains limited to 4096 entries / 4096 command bytes per entry.
+There is **no checkpoint compaction yet**; reaching the WAL cap causes
+fail-stop behavior. Metadata-only records are much smaller than Phase 16's
+complete snapshot rewrites, but replay of long journals can be expensive.
+
+**Compatibility boundary:** The prior `--elect-durable` mode still uses
+`node-ID.raft` snapshots. Do not switch the same node/data directory between
+snapshot and WAL modes: both explicitly reject a conflicting file. To learn
+the WAL mode with existing Phase 16 data, start a distinct **new educational
+cluster** using a different directory; do not erase a participating node's
+state as a migration strategy. There is no automatic migration protocol.
+
+**Recovery contract:** Only an interrupted/incomplete final WAL record is
+truncated and followed by `fsync`. A fully present record with invalid CRC or
+metadata prevents startup without resetting prior state. The returned node
+starts as follower; `lastApplied` and KV state are reconstructed by replaying
+committed log entries. Hardware durability depends on Linux and filesystem
+fsync guarantees. CRC32 detects accidental corruption, not malicious edits.
+
+**Important:** This remains an educational demo. The unauthenticated proposal
+acknowledges *admission*, not Raft commit; diagnostic reads are not
+linearizable. No WAL compaction, disk migration, authenticated RPCs, safe
+membership changes, or safe node replacement yet. Never run on untrusted
+networks.
+
+---
+
+## Previous milestone — Phase 16 durable snapshots
+
 A learning-oriented C11 distributed key-value store for Fedora Linux.
 
 **Current milestone: Phase 16 / 35 — Durable Raft term, vote, log and commit

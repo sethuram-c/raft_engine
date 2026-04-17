@@ -596,3 +596,80 @@ connections. Corrupt files are rejected, never overwritten with empty state.
 This is an educational atomic image, not an append-only write-ahead log. It
 can become expensive with large logs, has a deliberately strict 4 MiB cap, and
 does not handle safe replacement of a lost node identity or linearizable reads.
+
+
+## Phase 17 architecture — Incremental WAL and journal replay
+
+The Phase 17 mode is opt-in: `--elect-wal CONFIG DIRECTORY`. The Phase 16
+`--elect-durable` snapshot backend remains available with a separate directory.
+Both modes use `raft_storage_open()` to lock the node ID, but WAL and snapshot
+files for the same ID cannot be present in the same directory. This prevents
+silent creation of independent durable consensus histories.
+
+### Record format (portable, not C struct layout)
+
+```text
+WAL HEADER, exactly 20 bytes
+offset       0       8       12      16
+             +--------+-------+-------+-------+
+             |RAFT17WL|VER=1  |NODE ID|CRC32  |
+             | 8 bytes|u32 BE |u32 BE |u32 BE |
+             +--------+-------+-------+-------+
+
+EACH RECORD: [length:u32][CRC32:u32][payload:length bytes]
+PAYLOAD:     sequence:u64, term:u64, voted_for:u32, commitIndex:u64,
+             preserved_prefix_count:u32, appended_suffix_count:u32,
+             repeated suffix entries: [entryTerm:u64, commandLen:u32, bytes]
+```
+
+The WAL header CRC covers its first 16 bytes; each record CRC covers its
+payload. All multibyte integers use network byte order. A length cap, log
+entry-count/command limits, sequential record sequence numbers, and Raft
+term/vote/commit/log invariants are validated during replay.
+
+### Save pathway
+
+```text
+node mutex acquired
+  -> Raft mutation (term/vote/log/commitIndex)
+  -> compare against in-memory copy of last fsynced consensus state
+  -> find byte-identical shared log prefix
+  -> encode ONLY changed metadata and suffix (no-op if nothing changed)
+  -> preallocate next mirror state + WAL record
+  -> append frame -> fsync(journal fd)
+  -> swap in mirror; release node mutex; respond to peer
+```
+
+The disk mirror is replaced only after successful `fsync`. A save failure is
+fatal: the node stops serving and no consensus acknowledgement is emitted.
+
+### Recovery pathway
+
+```text
+lock ID + open WAL, refuse conflicting Phase16 snapshot
+  -> validate magic/version/node ID/header CRC
+  -> scan each frame: bound length -> full frame -> CRC -> seq -> metadata
+  -> replay prefix+suffix into temporary node and validate invariants
+  -> if ONLY incomplete tail: ftruncate to last good frame -> fsync WAL
+  -> otherwise on corruption: reject startup WITHOUT resetting state
+  -> reset to follower and randomized monotonic timer
+  -> apply committed prefix to fresh in-memory KV table
+  -> serve TCP with a memory mirror of last durable state
+```
+
+WAL size is limited to 64 MiB; current WAL replay builds a validated candidate
+copy for each delta and can take time for long histories. There is no compaction
+or automatic upgrade from a Phase 16 full snapshot yet. Entries may be present
+but uncommitted after restart; such entries are never applied merely by replay.
+
+### Safety boundaries
+
+- Crash recovery tested with `SIGKILL`, including binary SET/GET and uncommitted
+  log suffixes; filesystem or power-loss fault injection is not implemented.
+- CRC32 detects accidental corruption, not hostile tampering.
+- An incomplete *last* record is discarded; a complete corrupt record blocks
+  startup. The WAL itself is append-only except for torn-tail recovery.
+- Nodes cannot safely delete/recreate their own journal with the same voting
+  identity. Cluster reconfiguration and safe node replacement remain future work.
+- `--propose-demo` still acknowledges append admission, not commitment;
+  `--get-demo` is a local, unauthenticated and non-linearizable diagnostic.
