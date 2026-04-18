@@ -146,6 +146,8 @@ int raft_wal_open(raft_wal_t *wal, const char *directory, raft_node_id_t id,
         raft_wal_close(wal); return -1;
     }
     (void)snprintf(wal->file_name,sizeof(wal->file_name),"node-%" PRIu32 ".wal",id);
+    (void)snprintf(wal->temp_name,sizeof(wal->temp_name),
+                   "node-%" PRIu32 ".wal.compact.tmp",id);
     int fresh=0;
     wal->fd=openat(wal->lock.directory_fd,wal->file_name,
                    O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
@@ -168,6 +170,12 @@ int raft_wal_open(raft_wal_t *wal, const char *directory, raft_node_id_t id,
             fail(error,cap,"cannot durably create WAL header: %s",strerror(errno));
             raft_wal_close(wal); return -1;
         }
+    }
+    /* A crash before rename can leave an orphan temporary checkpoint. The
+     * locked WAL file is authoritative until rename succeeds. */
+    if (unlinkat(wal->lock.directory_fd,wal->temp_name,0)!=0 && errno!=ENOENT) {
+        fail(error,cap,"cannot remove orphan WAL checkpoint: %s",strerror(errno));
+        raft_wal_close(wal); return -1;
     }
     if (error && cap) error[0]='\0';
     return 0;
@@ -287,6 +295,105 @@ int raft_wal_load(raft_wal_t *wal, raft_node_t *node, int *found,
     return 0;
 }
 
+
+/* Same Phase 17 record framing for delta records and a full-state checkpoint.
+ * A checkpoint is sequence 1 with keep=0 and all current entries as suffix. */
+static int encode_record(const raft_node_t *node, size_t keep,
+                         uint64_t sequence, uint8_t **result, size_t *bytes,
+                         char *error, size_t cap)
+{
+    if (!state_valid(node) || keep>node->log.count || sequence==0 ||
+        node->log.count>UINT32_MAX) {
+        fail(error,cap,"invalid checkpoint/delta state"); return -1;
+    }
+    size_t size=RECORD_FIXED;
+    for (size_t i=keep;i<node->log.count;i++) {
+        size_t n=node->log.entries[i].command_len;
+        if (n>RAFT_STORAGE_MAX_COMMAND || size>RECORD_MAX-12-n) {
+            fail(error,cap,"WAL record exceeds bounded checkpoint size");return -1;
+        }
+        size+=12+n;
+    }
+    uint8_t *rec=malloc(8+size);
+    if (!rec) {fail(error,cap,"out of memory encoding WAL");return -1;}
+    uint8_t *p=rec+8;
+    p64(p,sequence);p64(p+8,node->current_term);
+    p32(p+16,node->voted_for);p64(p+20,node->commit_index);
+    p32(p+28,(uint32_t)keep);p32(p+32,(uint32_t)(node->log.count-keep));
+    size_t at=RECORD_FIXED;
+    for (size_t i=keep;i<node->log.count;i++) {
+        const raft_log_entry_t *e=&node->log.entries[i];
+        p64(p+at,e->term);p32(p+at+8,(uint32_t)e->command_len);at+=12;
+        if (e->command_len) memcpy(p+at,e->command,e->command_len);
+        at+=e->command_len;
+    }
+    p32(rec,(uint32_t)size);p32(rec+4,crc32(p,size));
+    *result=rec;
+    *bytes=8+size;
+    return 0;
+}
+
+int raft_wal_compact(raft_wal_t *wal, char *error, size_t cap)
+{
+    if (!wal || wal->fd<0 || !wal->loaded || !state_valid(&wal->previous) ||
+        wal->lock.directory_fd<0) {
+        fail(error,cap,"WAL checkpoint requires a loaded locked journal");return -1;
+    }
+    if (wal->sequence==0) {
+        if(error && cap) error[0]='\0';
+        return 0;
+    }
+    /* Pre-allocate and fully validate before creating any on-disk file. */
+    uint8_t *checkpoint=NULL;
+    size_t rec_bytes=0;
+    if (encode_record(&wal->previous,0,1,&checkpoint,&rec_bytes,error,cap)!=0)
+        return -1;
+    int temp=-1;
+    int saved_errno=0;
+    uint8_t header[WAL_HEADER];
+    memcpy(header,wal_magic,8);
+    p32(header+8,1);p32(header+12,wal->lock.id);
+    p32(header+16,crc32(header,16));
+    /* Exclusive lock is held by raft_storage_open. Stale temp files are
+     * harmless and can be removed; never modify the live WAL until rename. */
+    if (unlinkat(wal->lock.directory_fd,wal->temp_name,0)!=0 && errno!=ENOENT) {
+        fail(error,cap,"could not remove stale WAL temp: %s",strerror(errno));
+        free(checkpoint);return -1;
+    }
+    temp=openat(wal->lock.directory_fd,wal->temp_name,
+                O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    if (temp<0 || full_write(temp,header,sizeof(header))!=0 ||
+        full_write(temp,checkpoint,rec_bytes)!=0 || fsync(temp)!=0) {
+        saved_errno=errno;
+        fail(error,cap,"WAL checkpoint write/fsync failed: %s",strerror(saved_errno));
+        if (temp>=0) (void)close(temp);
+        (void)unlinkat(wal->lock.directory_fd,wal->temp_name,0);
+        free(checkpoint);return -1;
+    }
+    free(checkpoint);
+    /* One atomic rename: no two-file commit ambiguity. Old/new WAL are
+     * both independently replayable across all crash points. */
+    if (renameat(wal->lock.directory_fd,wal->temp_name,
+                 wal->lock.directory_fd,wal->file_name)!=0 ||
+        fsync(wal->lock.directory_fd)!=0) {
+        saved_errno=errno;
+        fail(error,cap,"WAL checkpoint rename/directory fsync failed: %s",
+             strerror(saved_errno));
+        (void)close(temp);
+        (void)unlinkat(wal->lock.directory_fd,wal->temp_name,0);
+        return -1; /* caller fail-stops on ambiguous fsync outcome */
+    }
+    (void)close(wal->fd);
+    wal->fd=temp;
+    wal->sequence=1;
+    if (lseek(wal->fd,0,SEEK_END)<0) {
+        fail(error,cap,"WAL checkpoint reposition failed: %s",strerror(errno));
+        return -1;
+    }
+    if(error && cap) error[0]='\0';
+    return 0;
+}
+
 int raft_wal_save(raft_wal_t *wal, const raft_node_t *node,
                   char *error, size_t cap)
 {
@@ -309,36 +416,22 @@ int raft_wal_save(raft_wal_t *wal, const raft_node_t *node,
         node->current_term==prev->current_term && node->voted_for==prev->voted_for &&
         node->commit_index==prev->commit_index) return 0;
 
-    size_t size=RECORD_FIXED;
-    for(size_t i=keep;i<node->log.count;i++) {
-        size_t n=node->log.entries[i].command_len;
-        if(size>RECORD_MAX-12-n) {fail(error,cap,"WAL record too large");return -1;}
-        size+=12+n;
-    }
     raft_node_t new_mirror;
     (void)raft_node_init(&new_mirror,node->id);
     if (copy_state(&new_mirror,node)!=0) {
         fail(error,cap,"cannot allocate WAL mirror before append");return -1;
     }
-    uint8_t *record=malloc(8+size);
-    if (!record) {raft_node_destroy(&new_mirror);fail(error,cap,"out of memory");return -1;}
-    uint8_t *p=record+8;
-    p64(p,wal->sequence+1);p64(p+8,node->current_term);
-    p32(p+16,node->voted_for);p64(p+20,node->commit_index);
-    p32(p+28,(uint32_t)keep);p32(p+32,(uint32_t)(node->log.count-keep));
-    size_t at=RECORD_FIXED;
-    for(size_t i=keep;i<node->log.count;i++) {
-        const raft_log_entry_t *e=&node->log.entries[i];
-        p64(p+at,e->term);p32(p+at+8,(uint32_t)e->command_len);at+=12;
-        if(e->command_len) memcpy(p+at,e->command,e->command_len);
-        at+=e->command_len;
+    uint8_t *record=NULL;
+    size_t record_bytes=0;
+    if (encode_record(node,keep,wal->sequence+1,&record,&record_bytes,
+                      error,cap)!=0) {
+        raft_node_destroy(&new_mirror);return -1;
     }
-    p32(record,(uint32_t)size);p32(record+4,crc32(p,size));
     struct stat st;
     if (fstat(wal->fd,&st)!=0 || st.st_size<0 ||
-        (uint64_t)st.st_size+8u+size>RAFT_WAL_MAX_FILE_BYTES ||
+        (uint64_t)st.st_size+record_bytes>RAFT_WAL_MAX_FILE_BYTES ||
         lseek(wal->fd,0,SEEK_END)<0 ||
-        full_write(wal->fd,record,size+8)!=0 || fsync(wal->fd)!=0) {
+        full_write(wal->fd,record,record_bytes)!=0 || fsync(wal->fd)!=0) {
         fail(error,cap,"WAL append/fsync failed (or file limit reached): %s",strerror(errno));
         raft_node_destroy(&new_mirror);free(record);return -1;
     }
@@ -346,6 +439,15 @@ int raft_wal_save(raft_wal_t *wal, const raft_node_t *node,
     raft_node_destroy(&wal->previous);
     wal->previous=new_mirror;
     ++wal->sequence;
+    /* Bound startup replay. Large journals are atomically checkpointed, but
+     * avoid rewriting a huge full image on every subsequent small change. */
+    if (fstat(wal->fd,&st)!=0) {
+        fail(error,cap,"WAL post-append stat failed: %s",strerror(errno));
+        return -1;
+    }
+    if (wal->sequence>=RAFT_WAL_COMPACT_AFTER_RECORDS ||
+        (st.st_size>=(off_t)RAFT_WAL_COMPACT_AT_BYTES && wal->sequence>=4))
+        return raft_wal_compact(wal,error,cap);
     if(error && cap) error[0]='\0';
     return 0;
 }

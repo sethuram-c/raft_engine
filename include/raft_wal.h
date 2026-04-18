@@ -6,8 +6,11 @@
 
 /* Phase 17: opt-in, append-only, fsync-before-ack incremental Raft journal.
  * The node-ID lock is shared with Phase 16; the two disk formats cannot
- * silently share a node ID/data directory. This format is not compacted. */
+ * silently share a node ID/data directory. Phase 18 adds atomic,
+ * single-WAL-file checkpoints that retain the entire Raft log. */
 #define RAFT_WAL_MAX_FILE_BYTES (64u * 1024u * 1024u)
+#define RAFT_WAL_COMPACT_AFTER_RECORDS 64u
+#define RAFT_WAL_COMPACT_AT_BYTES (256u * 1024u)
 
 typedef struct {
     raft_storage_t lock;
@@ -16,6 +19,7 @@ typedef struct {
     uint64_t sequence;
     int loaded;
     char file_name[48];
+    char temp_name[64];
 } raft_wal_t;
 
 /* Open and lock, create a new header if absent; refuse a Phase 16 snapshot.
@@ -31,6 +35,11 @@ int raft_wal_load(raft_wal_t *wal, raft_node_t *node, int *found,
  * Must be serialized by the node mutex, before consensus acknowledgments. */
 int raft_wal_save(raft_wal_t *wal, const raft_node_t *node,
                   char *error, size_t capacity);
+/* Atomically replace a validated WAL history with one full-image checkpoint
+ * record (sequence = 1); retain the entire Raft log including uncommitted
+ * entries. Safe only with exclusive node lock and serialized mutations.
+ * No-op for empty WAL. Return error on any failed durable transition. */
+int raft_wal_compact(raft_wal_t *wal, char *error, size_t capacity);
 void raft_wal_close(raft_wal_t *wal);
 
 #endif

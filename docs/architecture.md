@@ -673,3 +673,51 @@ but uncommitted after restart; such entries are never applied merely by replay.
   identity. Cluster reconfiguration and safe node replacement remain future work.
 - `--propose-demo` still acknowledges append admission, not commitment;
   `--get-demo` is a local, unauthenticated and non-linearizable diagnostic.
+
+
+## Phase 18: Single-file crash-atomic journal checkpoints
+
+The Phase 17 length/CRC-framed WAL remains the only authoritative durable
+image. On compaction, the node writes a **new WAL file** containing the same
+20-byte v1 header and exactly one full-state record: sequence `1`, current
+term, voted-for ID, commit index, `keep=0`, and every entry in the log. The
+record format deliberately stays compatible with the ordinary v1 replay path.
+
+```text
+persistent node-ID.lock (flock)
+     |
+     +-- live node-ID.wal: header + [delta 1][delta 2]...[delta N]
+     |                                 | valid and already fsynced
+     +-- node-ID.wal.compact.tmp: header + [full checkpoint]
+                                         | write/fsync
+                                         V
+                                   renameat(tmp, live)
+                                         |
+                                   fsync(directory)
+                                         |
+                            old fd closed, new fd retained
+                            sequence reset to 1
+```
+
+**Invariant:** the complete log, term/vote and committed index are preserved
+verbatim; the checkpoint discards **history of WAL updates**, not log entries.
+A smaller file reduces re-read frames. The state machine itself is rebuilt
+from committed entries at startup, just as before Phase 18.
+
+**Why one file?** Splitting checkpoint and WAL into two separately renamed
+files requires generation numbers and a recoverable two-file transaction.
+A single atomic file replacement preserves a clear old/new recovery choice.
+A post-rename directory-sync error fails closed, since its durable outcome
+could be ambiguous on a real filesystem.
+
+**Concurrency/locking:** the election/TCP server already holds its node mutex
+when persisting changes; the WAL also holds its per-node `flock`. The offline
+`--compact-wal` command uses the same lock and refuses a live node. No external
+RPC is added and no read or write operation bypasses WAL replay validation.
+
+**Boundaries:** WAL format v1 is unchanged, and automatic compaction occurs at
+64 records or >=256 KiB with >=4 records. The full log remains in each
+checkpoint. There is no log-prefix discard, snapshot replication,
+`InstallSnapshot` RPC, state-machine-only checkpoint, or WAL migration from
+Phase 16. CRC checks detect accidents, not malicious tampering. POSIX fsync
+and rename semantics depend on the local filesystem and hardware.

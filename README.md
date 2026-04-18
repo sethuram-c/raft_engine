@@ -2,6 +2,72 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
+**Current milestone: Phase 18 / 35 — Crash-atomic WAL checkpoints and compaction.**
+The Phase 17 `--elect-wal` mode now periodically compacts its journal into one
+**full-image checkpoint record inside the WAL file**, retaining the complete
+Raft log (including uncommitted suffixes), term, vote and commit index. This
+is **journal-history compaction**, not Raft log truncation or a state-machine
+snapshot. The serialized record remains compatible with Phase 17's on-disk
+format; existing journals load without migration.
+
+### Phase 18 quickstart
+
+```sh
+make clean && make && make test
+./build/test_raft_checkpoint
+python3 tests/test_checkpoint_integration.py ./build/raft-engine
+
+# Start the normal WAL cluster in three terminals:
+./build/raft-engine --elect-wal config/node1.conf data
+./build/raft-engine --elect-wal config/node2.conf data
+./build/raft-engine --elect-wal config/node3.conf data
+
+# Stop the cluster, then compact the three WALs OFFLINE:
+./build/raft-engine --compact-wal config/node1.conf data
+./build/raft-engine --compact-wal config/node2.conf data
+./build/raft-engine --compact-wal config/node3.conf data
+# Restart the WAL cluster using the SAME original data directory.
+```
+
+**Automatic policy:** after 64 durable record writes, or when the journal is
+at least 256 KiB and contains at least 4 records, the currently loaded node
+checkpoint is written and atomically installed. This bounds **number of
+delta records** replayed between checkpoints, not the number of log entries.
+The original in-memory log limits (4096 entries and max 4096 bytes per
+command), and maximum WAL size (64 MiB), remain in effect. WAL compaction
+retains the entire log and does NOT make log growth asymptotically bounded.
+A future Raft snapshot/install-snapshot phase is needed for safe prefix
+trimming and true long-term log-space bounds.
+
+**Crash transition:** writer holds the node lock and serializes consensus
+mutations. It encodes a self-contained checkpoint with sequence 1 and
+`keep=0`, writes a `node-ID.wal.compact.tmp` file with mode 0600,
+`fsync`s that file, `renameat`s it over `node-ID.wal`, then `fsync`s the
+directory. Before rename the old WAL is authoritative; after rename the
+checkpoint WAL is authoritative. Both images can be loaded independently,
+so power failure at the rename boundary leaves either a valid old history or
+its state-equivalent checkpoint on filesystems honoring those primitives.
+If any durability operation fails, the caller must fail-stop. A stale temp
+file from a pre-rename crash is discarded while holding the lock at startup.
+
+**Offline command:** `--compact-wal CONFIG DATA_DIR` acquires the same
+per-node exclusive lock as `--elect-wal`; it fails while that identity is
+running. It loads and validates the complete existing WAL before touching
+the live file. CRC-corrupt or semantically invalid complete records fail
+closed; only Phase 17's incomplete final-record recovery rule still applies.
+Do not use a wrong/new directory; the WAL open primitive creates an empty
+journal if one is missing. Back up your data directory before experiments.
+
+**Compatibility:** Phase 16 `--elect-durable` remains separate. Existing
+Phase 17 `node-ID.wal` files remain readable; no migration of snapshot mode.
+Unauthenticated diagnostic proposals still acknowledge admission, not commit;
+local GET is not linearizable. These files and examples are for local
+learning, not production or adversarial environments.
+
+---
+
+## Previous milestone — Phase 17 incremental WAL
+
 **Current milestone: Phase 17 / 35 — Append-only Write-Ahead Log (WAL) and incremental replay.**
 The new `--elect-wal` mode persists incremental changes to term, vote, commit
 index, and changed log suffixes in checksummed, length-framed journal records.

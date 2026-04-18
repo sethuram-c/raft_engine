@@ -521,3 +521,59 @@ git commit -m "feat: add incremental raft WAL and crash-safe journal replay"
 64 MiB WAL cap; no online migration from Phase 16; no client linearizability.
 
 **Next Phase 18:** WAL compaction / checkpoint creation and bounding replay time.
+
+
+## Phase 18 / 35 — WAL checkpoints and crash-atomic compaction
+
+**Planned milestone:** January 18, 2027 (record actual completion timestamp).
+**Time budget:** ~2 hours.
+
+### Deliverable
+
+Single-file checkpointing that atomically replaces a long Phase 17 delta WAL
+with an equivalent WAL header plus one full-state record, while retaining
+all entries, including uncommitted log suffixes. Existing WAL data remains
+compatible. A manual offline compaction CLI and automatic journal-length/
+record-count thresholds bound the number of delta frames replayed.
+
+### Acceptance checks
+
+- [x] Existing Phase 17 WAL files remain readable without format change.
+- [x] A new single-record checkpoint replays the same term, vote, log and commit.
+- [x] Uncommitted log suffix is preserved and not applied on restart.
+- [x] `fsync(temp)` -> atomic rename -> `fsync(dir)` before a successful checkpoint.
+- [x] Stale temporary checkpoint ignored and removed under node lock.
+- [x] Existing corruption validation rejects bad checksums before compaction.
+- [x] Automatic compaction at 64 records or >=256 KiB with >=4 records.
+- [x] Offline `--compact-wal CONFIG DATA_DIR` requires the exclusive WAL lock.
+- [x] Commit/persistence semantics and old client interfaces remain unchanged.
+- [x] Dedicated unit, live three-process crash/restart and sanitizer tests.
+- [ ] Run the complete suite and inspect local Git diff on Fedora.
+- [ ] Commit using the actual date after review.
+
+### Verify
+
+```sh
+make clean && make && make test
+./build/test_raft_checkpoint
+python3 tests/test_checkpoint_integration.py ./build/raft-engine
+# Stop any node before running its manual compaction:
+./build/raft-engine --compact-wal config/node1.conf data
+```
+
+### Git commit: exact changed files
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+    include/raft_wal.h src/raft_wal.c src/main.c \
+    tests/test_raft_checkpoint.c tests/test_checkpoint_integration.py
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: atomically compact raft WAL into recoverable checkpoints"
+```
+
+**Scope limitation:** This does not truncate the actual Raft log. The disk
+image grows with retained log entries; a future state-machine snapshot and
+InstallSnapshot RPC are needed for real log-prefix compaction.
+
+**Next:** Phase 19 — Raft state-machine snapshots and prefix-trimming design.

@@ -4,6 +4,7 @@
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
+#include "raft_wal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -145,6 +146,36 @@ static int elect_wal_server(const char *path, const char *directory)
         return 1;
     }
     return 0;
+}
+
+/* Offline operation: obtaining the per-node lock prevents concurrent
+ * compaction while a server is modifying the WAL. */
+static int compact_wal_offline(const char *path, const char *directory)
+{
+    raft_cluster_config_t config;
+    if (load_config(path,&config)!=0) return 1;
+    raft_wal_t wal;
+    char error[256]={0};
+    if (raft_wal_open(&wal,directory,config.node_id,error,sizeof(error))!=0) {
+        fprintf(stderr,"WAL checkpoint open: %s\n",error);return 1;
+    }
+    raft_node_t node;
+    if (raft_node_init(&node,config.node_id)!=RAFT_OK) {
+        raft_wal_close(&wal);return 1;
+    }
+    int found=0;
+    int ok=raft_wal_load(&wal,&node,&found,error,sizeof(error));
+    if (ok==0) ok=raft_wal_compact(&wal,error,sizeof(error));
+    if (ok==0)
+        printf("WAL checkpoint: node=%u records=%llu term=%llu entries=%llu commit=%llu\n",
+               config.node_id,(unsigned long long)wal.sequence,
+               (unsigned long long)node.current_term,
+               (unsigned long long)raft_log_last_index(&node.log),
+               (unsigned long long)node.commit_index);
+    else fprintf(stderr,"WAL checkpoint failed: %s\n",error);
+    raft_node_destroy(&node);
+    raft_wal_close(&wal);
+    return ok==0 ? 0 : 1;
 }
 
 static int status_peer(const char *path, const char *peer_text)
@@ -482,7 +513,7 @@ static int get_demo_peer(const char *path, const char *peer_text, const char *ke
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
+          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --compact-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
@@ -512,6 +543,8 @@ int main(int argc, char **argv)
         return elect_durable_server(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--elect-wal") == 0)
         return elect_wal_server(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--compact-wal") == 0)
+        return compact_wal_offline(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--status") == 0)
         return status_peer(argv[2], argv[3]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)
