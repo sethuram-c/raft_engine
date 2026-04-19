@@ -5,6 +5,7 @@
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
 #include "raft_wal.h"
+#include "raft_snapshot.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -510,10 +511,64 @@ static int get_demo_peer(const char *path, const char *peer_text, const char *ke
             (const uint8_t *)key, strlen(key)) == 0 ? 0 : 1;
 }
 
+/* Phase 19 offline lab: write a bounded snapshot and trim an in-memory log.
+ * This does NOT change a live server or its persistent WAL format. */
+static int snapshot_demo(const char *directory)
+{
+    raft_node_t node, fresh;
+    raft_kv_store_t kv, restored;
+    raft_snapshot_t snapshot, decoded;
+    if (raft_node_init(&node,1)!=RAFT_OK) return 1;
+    raft_kv_init(&kv);
+    raft_kv_init(&restored);
+    raft_snapshot_init(&snapshot);
+    raft_snapshot_init(&decoded);
+    node.current_term=2;
+    int ok = raft_log_append(&node.log,1,"SET alpha one",13)==RAFT_OK &&
+             raft_log_append(&node.log,1,"SET beta two",12)==RAFT_OK &&
+             raft_log_append(&node.log,2,"DEL alpha",9)==RAFT_OK;
+    node.commit_index=2;
+    raft_index_t applied=0;
+    if (ok) ok=raft_apply_committed(&node,&kv,&applied)==RAFT_OK;
+    if (ok) ok=raft_snapshot_capture(&node,&kv,&snapshot)==RAFT_OK;
+    if (ok) ok=raft_snapshot_write_file(directory,"phase19.snap",&snapshot)==0;
+    if (ok) ok=raft_snapshot_read_file(directory,"phase19.snap",&decoded)==0;
+    if (ok) ok=raft_snapshot_compact_applied(&node,&snapshot)==RAFT_OK;
+    if (ok) ok=raft_node_init(&fresh,2)==RAFT_OK;
+    else memset(&fresh,0,sizeof(fresh));
+    if (ok) {
+        fresh.current_term=2;
+        ok=raft_snapshot_restore_fresh(&decoded,&fresh,&restored)==RAFT_OK;
+    }
+    if (ok) ok=raft_log_append(&fresh.log,2,"DEL alpha",9)==RAFT_OK;
+    if (ok) {
+        fresh.commit_index=3;
+        ok=raft_apply_committed(&fresh,&restored,&applied)==RAFT_OK;
+    }
+    if (ok) {
+        const uint8_t *value=NULL;
+        size_t length=0;
+        ok=raft_kv_get(&restored,(const uint8_t *)"alpha",5,&value,&length)==0;
+        if (ok) ok=raft_kv_get(&restored,(const uint8_t *)"beta",4,&value,&length)==1 &&
+                    length==3 && memcmp(value,"two",3)==0;
+    }
+    if (ok)
+        printf("Snapshot demo: boundary=%llu/%llu retained=%zu replay_applied=%llu keys=%zu file=%s/phase19.snap\n",
+            (unsigned long long)node.log.base_index,
+            (unsigned long long)node.log.base_term,node.log.count,
+            (unsigned long long)fresh.last_applied,restored.count,directory);
+    else fputs("Snapshot demo failed (directory must already exist and be writable)\n",stderr);
+    raft_node_destroy(&node);
+    if (fresh.id) raft_node_destroy(&fresh);
+    raft_kv_destroy(&kv); raft_kv_destroy(&restored);
+    raft_snapshot_destroy(&snapshot); raft_snapshot_destroy(&decoded);
+    return ok ? 0 : 1;
+}
+
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--log-demo | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --compact-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
+          "--log-demo | --snapshot-demo DIRECTORY | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --compact-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
@@ -533,6 +588,8 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--demo") == 0) return demo();
     if (argc == 2 && strcmp(argv[1], "--log-demo") == 0) return log_demo();
+    if (argc == 3 && strcmp(argv[1], "--snapshot-demo") == 0)
+        return snapshot_demo(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--timer-demo") == 0)
         return timer_demo(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--check-config") == 0)

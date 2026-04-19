@@ -145,6 +145,7 @@ int raft_storage_save(raft_storage_t *store, const raft_node_t *node,
 {
     if (!store || store->directory_fd < 0 || store->lock_fd < 0 ||
         !node || node->id != store->id || !raft_node_is_valid(node) ||
+        node->log.base_index != 0 || /* Phase 16 format has no base fields */
         node->log.count > RAFT_STORAGE_MAX_ENTRIES ||
         node->log.count > UINT32_MAX) {
         errout(error, cap, "invalid or oversized durable node state");

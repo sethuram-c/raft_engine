@@ -734,3 +734,32 @@ a trusted local lab. No key-value state-machine application (`lastApplied`
 remains zero), snapshots, read consistency, storage layer, production client
 protocol, or generalized membership. These are later milestones. See
 `docs/architecture.md` and the separate Phase 14 learning guide.
+
+
+## Phase 19: state-machine snapshots and in-memory prefix compaction
+
+A versioned `RAFT19SN` snapshot saves the **applied** key-value state,
+`lastIncludedIndex`, `lastIncludedTerm`, and deterministic execution counters.
+Keys and values are binary-safe where appropriate. CRC32 rejects accidental
+corruption. The offline demo uses temporary-file write, file `fsync`, atomic
+rename and directory `fsync` before demonstrating an **in-memory-only** trim.
+The compacted log keeps the virtual `(base_index, base_term)` entry, which
+allows newer suffix entries to keep their original absolute Raft indices.
+
+```sh
+make clean && make && make test
+./build/test_raft_snapshot
+mkdir -p /tmp/raft-phase19-lab
+./build/raft-engine --snapshot-demo /tmp/raft-phase19-lab
+ls -l /tmp/raft-phase19-lab/phase19.snap
+```
+
+**Safety boundary:** `--elect-wal` and `--elect-durable` intentionally **do
+not** compact their live logs or consume Phase 19 snapshot files. Their
+persisted formats still lack a compacted-log base index/term and snapshot
+generation transactions, and TCP has no InstallSnapshot RPC yet. The old disk
+writers reject compacted logs rather than silently persisting incomplete
+state. Phase 19 is a thoroughly tested *offline format and indexing milestone*,
+not production-ready space reclamation. Do not run this demo against a live
+node's data directory. Full log/WAL replacement and lagging-follower snapshot
+installation remain future work. See `docs/architecture.md`.

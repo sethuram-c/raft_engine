@@ -721,3 +721,55 @@ checkpoint. There is no log-prefix discard, snapshot replication,
 `InstallSnapshot` RPC, state-machine-only checkpoint, or WAL migration from
 Phase 16. CRC checks detect accidents, not malicious tampering. POSIX fsync
 and rename semantics depend on the local filesystem and hardware.
+
+
+## Phase 19: state-machine snapshots and virtual log prefix
+
+Raft log indices are **absolute**, even after compacting early entries. The
+`raft_log_t` structure adds `(base_index, base_term)` for the virtual retained
+entry, with an array for **only** the entries after that boundary.
+
+```text
+logical Raft indexes:     1    2    3    4    5
+                               ^            ^
+       snapshot boundary: (3, term=2)      last=5
+retained in-memory data: [4, term=2] [5, term=3]
+term_at(3)=2; at(3)=NULL; at(2)=NULL; at(4)=entry
+last_index = base_index + count = 3+2 = 5
+```
+
+`raft_log_compact_prefix` verifies the boundary index/term and frees the old
+commands before moving the retained suffix. Callers are responsible for the
+**consensus precondition** `boundary <= lastApplied <= commitIndex`; the safer
+`raft_snapshot_compact_applied` enforces this and matches a captured snapshot.
+Normal un-compacted logs remain `base_index=0, base_term=0` and preserve all
+previous index semantics. Reconciliation, truncate, and term lookup use the
+absolute base offset; a compacted entry is never exposed as a command.
+
+The Phase 19 `raft_snapshot_t` stores:
+- `last_index, last_term` representing exactly the last *applied* log entry
+- `executed_commands, ignored_commands` to preserve diagnostic counters
+- a bounded table of unique validated ASCII keys and arbitrary binary values
+
+Its standalone disk envelope uses 8-byte `RAFT19SN` magic, a 32-bit version
+(1), 64-bit last index, last term, executed and ignored counts, and a 32-bit
+key count (48 bytes total). Each record contains 16-bit key length, 16-bit
+value length and the actual bytes, followed by CRC32 over the entire prefix.
+All numeric fields are big-endian. The decoder validates strict lengths,
+unique keys, max 128 keys, 64-byte keys, 1,024-byte values, counters, checksum,
+and trailing data, and only then replaces the caller's snapshot. The writer
+performs `write -> fsync(file) -> renameat -> fsync(directory)` in a trusted
+directory. The file-level API requires callers to serialize writers; the
+Phase 19 CLI is exclusively an isolated lab, not a live service.
+
+**Crash safety boundary:** The snapshot format and in-memory compaction are
+NOT wired to Raft's active storage. A durable log compaction transaction must
+commit a snapshot and its suffix metadata together; otherwise a crash can
+leave missing committed entries. Previous Phase 16/17/18 files do not carry
+base index/term. Their writers deliberately reject nonzero bases.
+A follower too far behind the leader's base needs an `InstallSnapshot` RPC
+instead of a regular AppendEntries retry. Elections must compare absolute last
+index/term, and live leaders must not trim without peer catch-up support.
+Those features are postponed. The demo saves a separate snapshot file, trims
+only its local test log, and restores into a *fresh* in-memory node before
+applying a retained suffix. CRC32 is not authentication.

@@ -106,7 +106,8 @@ static int entry_equal(const raft_log_entry_t *a, const raft_log_entry_t *b)
 }
 static int state_valid(const raft_node_t *n)
 {
-    if (!n || !raft_node_is_valid(n) || n->log.count>RAFT_STORAGE_MAX_ENTRIES) return 0;
+    if (!n || !raft_node_is_valid(n) || n->log.base_index!=0 ||
+        n->log.count>RAFT_STORAGE_MAX_ENTRIES) return 0;
     for(size_t i=0;i<n->log.count;i++)
         if (n->log.entries[i].command_len>RAFT_STORAGE_MAX_COMMAND) return 0;
     return 1;

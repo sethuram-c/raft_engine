@@ -15,6 +15,8 @@ typedef struct {
     raft_log_entry_t *entries;
     size_t count;
     size_t capacity;
+    raft_index_t base_index; /* last compacted index (virtual retained boundary) */
+    raft_term_t base_term;   /* term at base_index; 0/0 before snapshots */
 } raft_log_t;
 
 void raft_log_init(raft_log_t *log);
@@ -26,8 +28,13 @@ const raft_log_entry_t *raft_log_at(const raft_log_t *log, raft_index_t index);
 raft_status_t raft_log_term_at(const raft_log_t *log, raft_index_t index,
                                 raft_term_t *out_term);
 raft_status_t raft_log_truncate_from(raft_log_t *log, raft_index_t first_index);
+/* Drop through index, retaining its index/term as an implicit boundary.
+ * Caller must first ensure index <= lastApplied <= commitIndex. */
+raft_status_t raft_log_compact_prefix(raft_log_t *log, raft_index_t index,
+                                      raft_term_t term);
 
-/* Raft logical index 0 is a virtual entry with term 0. */
+/* A compacted log has a virtual (base_index,base_term) boundary.
+ * Before compaction this is logical index 0 with term 0. */
 int raft_log_matches(const raft_log_t *log, raft_index_t index,
                      raft_term_t term);
 raft_status_t raft_log_last_term(const raft_log_t *log, raft_term_t *out_term);

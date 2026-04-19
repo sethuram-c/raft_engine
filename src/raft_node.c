@@ -24,6 +24,11 @@ int raft_node_is_valid(const raft_node_t *node)
     if (node == NULL || node->id == RAFT_NO_VOTE ||
         node->role < RAFT_FOLLOWER || node->role > RAFT_LEADER ||
         node->log.count > node->log.capacity ||
+        node->log.base_index > UINT64_MAX - (raft_index_t)node->log.count ||
+        (node->log.base_index == 0) != (node->log.base_term == 0) ||
+        node->log.base_term > node->current_term ||
+        node->last_applied < node->log.base_index ||
+        node->commit_index < node->log.base_index ||
         (node->log.count != 0 && node->log.entries == NULL) ||
         node->last_applied > node->commit_index ||
         node->commit_index > raft_log_last_index(&node->log)) return 0;
@@ -34,7 +39,7 @@ int raft_node_is_valid(const raft_node_t *node)
         timer->timeout_ms > timer->max_ms ||
         timer->rng_state == 0 ||
         timer->deadline_ms < timer->timeout_ms)) return 0;
-    raft_term_t previous = 0;
+    raft_term_t previous = node->log.base_term;
     for (size_t i = 0; i < node->log.count; ++i) {
         const raft_log_entry_t *entry = &node->log.entries[i];
         if (entry->term == 0 || entry->term < previous ||

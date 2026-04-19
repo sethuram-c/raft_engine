@@ -10,6 +10,8 @@ void raft_log_init(raft_log_t *log)
         log->entries = NULL;
         log->count = 0;
         log->capacity = 0;
+        log->base_index = 0;
+        log->base_term = 0;
     }
 }
 
@@ -41,7 +43,10 @@ raft_status_t raft_log_append(raft_log_t *log, raft_term_t term,
 {
     if (log == NULL || term == 0 || (command_len != 0 && command == NULL))
         return RAFT_ERR_INVALID_ARGUMENT;
-    if (log->count && term < log->entries[log->count - 1].term)
+    if (log->base_index > UINT64_MAX - (raft_index_t)log->count)
+        return RAFT_ERR_INVALID_ARGUMENT;
+    if (raft_log_last_index(log) == UINT64_MAX) return RAFT_ERR_OUT_OF_RANGE;
+    if (term < (log->count ? log->entries[log->count - 1].term : log->base_term))
         return RAFT_ERR_TERM_REGRESSION;
     uint8_t *copy = NULL;
     if (command_len != 0) {
@@ -63,20 +68,21 @@ raft_status_t raft_log_append(raft_log_t *log, raft_term_t term,
 
 raft_index_t raft_log_last_index(const raft_log_t *log)
 {
-    return log == NULL ? 0 : (raft_index_t)log->count;
+    return log == NULL ? 0 : log->base_index + (raft_index_t)log->count;
 }
 
 const raft_log_entry_t *raft_log_at(const raft_log_t *log, raft_index_t index)
 {
-    if (log == NULL || index == 0 || index > log->count) return NULL;
-    return &log->entries[(size_t)(index - 1)];
+    if (log == NULL || index <= log->base_index ||
+        index > raft_log_last_index(log)) return NULL;
+    return &log->entries[(size_t)(index - log->base_index - 1)];
 }
 
 raft_status_t raft_log_term_at(const raft_log_t *log, raft_index_t index,
                                 raft_term_t *out_term)
 {
     if (log == NULL || out_term == NULL) return RAFT_ERR_INVALID_ARGUMENT;
-    if (index == 0) { *out_term = 0; return RAFT_OK; }
+    if (index == log->base_index) { *out_term = log->base_term; return RAFT_OK; }
     const raft_log_entry_t *entry = raft_log_at(log, index);
     if (entry == NULL) return RAFT_ERR_OUT_OF_RANGE;
     *out_term = entry->term;
@@ -85,15 +91,46 @@ raft_status_t raft_log_term_at(const raft_log_t *log, raft_index_t index,
 
 raft_status_t raft_log_truncate_from(raft_log_t *log, raft_index_t first_index)
 {
-    if (log == NULL || first_index == 0) return RAFT_ERR_INVALID_ARGUMENT;
-    if (first_index - 1 > log->count) return RAFT_ERR_OUT_OF_RANGE;
-    size_t first = (size_t)(first_index - 1);
+    if (log == NULL || first_index <= log->base_index)
+        return RAFT_ERR_INVALID_ARGUMENT;
+    if (first_index - log->base_index - 1 > log->count)
+        return RAFT_ERR_OUT_OF_RANGE;
+    size_t first = (size_t)(first_index - log->base_index - 1);
     for (size_t i = first; i < log->count; ++i) {
         free(log->entries[i].command);
         log->entries[i].command = NULL;
         log->entries[i].command_len = 0;
     }
     log->count = first;
+    return RAFT_OK;
+}
+
+raft_status_t raft_log_compact_prefix(raft_log_t *log, raft_index_t index,
+                                      raft_term_t term)
+{
+    if (log == NULL || (index == 0) != (term == 0) ||
+        index < log->base_index || index > raft_log_last_index(log) ||
+        !raft_log_matches(log, index, term)) return RAFT_ERR_INVALID_ARGUMENT;
+    if (index == log->base_index) return RAFT_OK;
+    size_t remove = (size_t)(index - log->base_index);
+    for (size_t i = 0; i < remove; ++i) free(log->entries[i].command);
+    size_t remaining = log->count - remove;
+    if (remaining) memmove(log->entries, log->entries + remove,
+                           remaining * sizeof(*log->entries));
+    log->count = remaining;
+    if (remaining == 0) {
+        free(log->entries);
+        log->entries = NULL;
+        log->capacity = 0;
+    } else {
+        raft_log_entry_t *smaller = realloc(log->entries, remaining * sizeof(*smaller));
+        if (smaller != NULL) {
+            log->entries = smaller;
+            log->capacity = remaining;
+        } /* Shrink failure does not invalidate a logically compacted log. */
+    }
+    log->base_index = index;
+    log->base_term = term;
     return RAFT_OK;
 }
 
@@ -122,14 +159,16 @@ raft_status_t raft_log_reconcile(raft_log_t *log,
         (entry_count && entries == NULL) ||
         committed_index > raft_log_last_index(log))
         return RAFT_ERR_INVALID_ARGUMENT;
-    /* Validate the logical 0/0 prefix and avoid overflow on all counts. */
+    /* Validate the virtual boundary and avoid overflow on all counts. */
     if ((prev_index == 0) != (prev_term == 0))
         return RAFT_ERR_INVALID_ARGUMENT;
     if (entry_count > UINT64_MAX - prev_index)
         return RAFT_ERR_INVALID_ARGUMENT;
     const size_t max_entries = SIZE_MAX / sizeof(*log->entries);
-    if (entry_count > max_entries || prev_index > max_entries ||
-        entry_count > max_entries - (size_t)prev_index)
+    if (prev_index < log->base_index) return RAFT_ERR_LOG_MISMATCH;
+    if (entry_count > max_entries ||
+        prev_index - log->base_index > max_entries ||
+        entry_count > max_entries - (size_t)(prev_index - log->base_index))
         return RAFT_ERR_INVALID_ARGUMENT;
     if (!raft_log_matches(log, prev_index, prev_term))
         return RAFT_ERR_LOG_MISMATCH;
@@ -143,7 +182,7 @@ raft_status_t raft_log_reconcile(raft_log_t *log,
         previous_term = entries[i].term;
     }
 
-    const size_t prev = (size_t)prev_index;
+    const size_t prev = (size_t)(prev_index - log->base_index);
     size_t matching = 0;
     while (matching < entry_count && matching < log->count - prev &&
            log->entries[prev + matching].term == entries[matching].term)
@@ -155,7 +194,8 @@ raft_status_t raft_log_reconcile(raft_log_t *log,
         return RAFT_OK;
     }
     const size_t keep = prev + matching;
-    if (keep < committed_index) return RAFT_ERR_COMMITTED_CONFLICT;
+    if (log->base_index + (raft_index_t)keep < committed_index)
+        return RAFT_ERR_COMMITTED_CONFLICT;
 
     /* Construct a replacement array without disturbing log's old ownership. */
     const size_t final_count = prev + entry_count;

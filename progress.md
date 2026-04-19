@@ -577,3 +577,50 @@ image grows with retained log entries; a future state-machine snapshot and
 InstallSnapshot RPC are needed for real log-prefix compaction.
 
 **Next:** Phase 19 — Raft state-machine snapshots and prefix-trimming design.
+
+
+## Phase 19 / 35 - State-machine snapshots and log-prefix foundations
+
+**Planned milestone:** January 19, 2027 (commit with actual completion date).
+
+### Delivered
+
+- [x] Binary-safe, bounded, checksummed v1 state-machine snapshot format.
+- [x] Snapshot captures exactly the `lastApplied` index and corresponding term.
+- [x] Atomic offline snapshot writes and strict, transactional decoding.
+- [x] In-memory Raft log uses an absolute `(base_index, base_term)` boundary.
+- [x] Safe prefix trimming through an applied snapshot, retaining suffix.
+- [x] Restore applied KV state into a fresh node and replay later log entries.
+- [x] Legacy log, storage and WAL tests remain passing.
+- [x] Durable writers refuse nonzero compacted bases until format migration.
+- [x] Offline `--snapshot-demo DIRECTORY`, snapshot tests and shell integration.
+- [ ] Inspect Git diff and run `make test` on Fedora.
+- [ ] Commit using actual date.
+
+### Acceptance commands
+
+```sh
+make clean && make && make test
+./build/test_raft_snapshot
+mkdir -p /tmp/raft-p19
+./build/raft-engine --snapshot-demo /tmp/raft-p19
+```
+
+### Commit staging - all Phase 19 additions and modifications
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+    include/raft_log.h include/raft_snapshot.h \
+    src/raft_log.c src/raft_node.c src/raft_storage.c src/raft_wal.c \
+    src/raft_snapshot.c src/main.c \
+    tests/test_raft_snapshot.c tests/test_snapshot_demo.sh
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: add raft state machine snapshots and log prefix boundaries"
+```
+
+**Limit:** Live Raft/WAL log truncation is *not enabled*. InstallSnapshot,
+atomic snapshot/WAL generation migration, and replication catch-up from a
+compacted leader are required for safe online compaction.
+
+**Next:** Phase 20 - InstallSnapshot RPC and lagging-follower catch-up design.
