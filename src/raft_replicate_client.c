@@ -213,3 +213,18 @@ int raft_replicate_client_demo_get(const raft_cluster_config_t *config,
     puts("Diagnostic only: local read, no leader/lease or linearizability guarantee.");
     return 0;
 }
+
+/* Educational one-shot trigger, not a production administrator API. */
+int raft_replicate_client_snapshot_compact(const raft_cluster_config_t *config,
+                                           raft_node_id_t peer_id)
+{
+    if (!config) return -1;
+    uint8_t response[17]; size_t length=0;
+    if (request_diagnostic(config,peer_id,RAFT_WIRE_SNAPSHOT_COMPACT_DEMO,
+        NULL,0,RAFT_WIRE_SNAPSHOT_COMPACT_RESPONSE,response,sizeof(response),&length)!=0 ||
+        length!=sizeof(response) || response[16]>1) return -1;
+    printf("Snapshot compact: peer=%u boundary=%llu/%llu accepted=%u\n",
+           peer_id,(unsigned long long)read_u64(response),
+           (unsigned long long)read_u64(response+8),response[16]);
+    return response[16] ? 0 : 2;
+}

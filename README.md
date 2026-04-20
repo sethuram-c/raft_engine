@@ -2,7 +2,45 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 18 / 35 — Crash-atomic WAL checkpoints and compaction.**
+**Current milestone: Phase 20 / 35 — InstallSnapshot RPC & Lagging-Follower Catch-Up.**
+
+Phase 20 introduces a separate, **in-memory only** `--elect-snapshot` cluster mode.
+After quorum commitment and local application, a development-only administrative
+RPC can compact the elected leader through `lastApplied`. A follower whose
+replication position is at/before that boundary then receives a CRC32-checked
+snapshot in bounded, offset-acknowledged framed TCP chunks. The follower
+installs KV state and the virtual `(lastIncludedIndex, lastIncludedTerm)`
+log boundary, preserves a matching suffix, and resumes AppendEntries.
+
+### Phase 20 quickstart
+
+```sh
+make clean && make && make test
+./build/test_raft_install
+python3 tests/test_install_integration.py ./build/raft-engine
+
+# Start a three-node cluster (separate terminals):
+./build/raft-engine --elect-snapshot config/node1.conf
+./build/raft-engine --elect-snapshot config/node2.conf
+./build/raft-engine --elect-snapshot config/node3.conf
+
+# Discover the leader (example: node 2):
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 'SET alpha 1'
+# After the entry has committed and applied, trigger educational compaction:
+./build/raft-engine --snapshot-compact-demo config/node1.conf 2
+./build/raft-engine --apply-status config/node1.conf 2
+```
+
+**Safety boundary:** The existing `--elect`, `--elect-durable` and `--elect-wal`
+modes are not changed to compact Raft prefixes or install snapshots. The
+Phase 20 transfer is **not crash durable**, does **not** migrate the WAL format,
+and is **not authenticated**. Do not use it with production data. Phase 21 will
+focus on snapshot persistence / WAL-coordinated recovery.
+
+---
+
+**Previously (Phase 18): Phase 18 / 35 — Crash-atomic WAL checkpoints and compaction.**
 The Phase 17 `--elect-wal` mode now periodically compacts its journal into one
 **full-image checkpoint record inside the WAL file**, retaining the complete
 Raft log (including uncommitted suffixes), term, vote and commit index. This

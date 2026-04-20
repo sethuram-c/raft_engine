@@ -125,6 +125,18 @@ static int elect_server(const char *path)
     return 0;
 }
 
+static int elect_snapshot_server(const char *path)
+{
+    raft_cluster_config_t config;
+    if (load_config(path,&config)!=0) return 1;
+    char error[256]={0};
+    if (raft_tcp_elect_snapshot(&config,error,sizeof(error))!=0) {
+        fprintf(stderr,"Snapshot election server failed: %s\n",error);
+        return 1;
+    }
+    return 0;
+}
+
 static int elect_durable_server(const char *path, const char *directory)
 {
     raft_cluster_config_t config;
@@ -568,7 +580,7 @@ static int snapshot_demo(const char *directory)
 static void usage(void)
 {
     fputs("Usage: raft-engine [--version | --demo | --check-config PATH | "
-          "--log-demo | --snapshot-demo DIRECTORY | --serve PATH [--max-connections N] | --elect PATH | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --compact-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
+          "--log-demo | --snapshot-demo DIRECTORY | --serve PATH [--max-connections N] | --elect PATH | --elect-snapshot PATH | --snapshot-compact-demo PATH LEADER_ID | --elect-durable PATH DATA_DIR | --elect-wal PATH DATA_DIR | --compact-wal PATH DATA_DIR | --status PATH PEER_ID | --probe PATH PEER_ID | "
           "--ping PATH PEER_ID MESSAGE | --timer-demo PATH | "
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
@@ -596,6 +608,18 @@ int main(int argc, char **argv)
         return check_config(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--elect") == 0)
         return elect_server(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--elect-snapshot") == 0)
+        return elect_snapshot_server(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "--snapshot-compact-demo") == 0) {
+        raft_cluster_config_t config;
+        uint64_t peer_id=0;
+        if (load_config(argv[2],&config)!=0 ||
+            parse_decimal_u64(argv[3],&peer_id)!=0 ||
+            peer_id==0 || peer_id>UINT32_MAX || peer_id==config.node_id ||
+            raft_config_peer_for_id(&config,(raft_node_id_t)peer_id)==NULL) return 1;
+        return raft_replicate_client_snapshot_compact(&config,
+                         (raft_node_id_t)peer_id)==0 ? 0 : 1;
+    }
     if (argc == 4 && strcmp(argv[1], "--elect-durable") == 0)
         return elect_durable_server(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--elect-wal") == 0)

@@ -21,4 +21,6 @@ int raft_replicate_client_apply_status(const raft_cluster_config_t *config,
 int raft_replicate_client_demo_get(const raft_cluster_config_t *config,
                                    raft_node_id_t peer_id,
                                    const uint8_t *key, size_t key_len);
+int raft_replicate_client_snapshot_compact(const raft_cluster_config_t *config,
+                                           raft_node_id_t leader_id);
 #endif

@@ -624,3 +624,46 @@ atomic snapshot/WAL generation migration, and replication catch-up from a
 compacted leader are required for safe online compaction.
 
 **Next:** Phase 20 - InstallSnapshot RPC and lagging-follower catch-up design.
+
+
+## Phase 20 / 35 — InstallSnapshot RPC & Lagging-Follower Recovery
+
+- [x] Encode/decode bounded 40-byte chunk requests and 13-byte responses.
+- [x] Validate membership, term, CRC, snapshot metadata, offsets and lengths.
+- [x] Support resumable in-memory assembly across multiple TCP connections.
+- [x] Install KV state and snapshot `(index, term)` boundary while retaining a
+      matching follower suffix and never overwriting a conflicting committed suffix.
+- [x] Leader switches from AppendEntries to snapshot transfer when `nextIndex`
+      crosses compacted `base_index`, then returns to ordinary replication.
+- [x] Add opt-in `--elect-snapshot` and educational `--snapshot-compact-demo`.
+- [x] Preserve the older `--elect-durable` / `--elect-wal` disk formats and tests.
+- [x] Unit, three-node TCP integration, and targeted Clang sanitizer tests.
+- [ ] Run locally on Fedora, inspect Git diff and commit using the actual date.
+
+### Acceptance commands
+
+```sh
+make clean && make && make test
+./build/test_raft_install
+python3 tests/test_install_integration.py ./build/raft-engine
+```
+
+### Git staging — all Phase 20 additions / changes
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_install.h include/raft_wire.h include/raft_tcp.h \
+  include/raft_replicate_client.h \
+  src/raft_install.c src/raft_wire.c src/raft_tcp.c \
+  src/raft_replicate_client.c src/main.c \
+  tests/test_raft_install.c tests/test_install_integration.py
+
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: transfer raft snapshots to lagging followers over TCP"
+```
+
+**Boundary:** Phase 20 snapshot mode is memory-only, unauthenticated and
+educational. Full crash-safe snapshots integrated with WAL are not implemented.
+
+**Next:** Phase 21 — Snapshot/WAL generation consistency and crash recovery.

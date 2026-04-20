@@ -10,6 +10,8 @@
 #include "raft_state_machine.h"
 #include "raft_storage.h"
 #include "raft_wal.h"
+#include "raft_install.h"
+#include <stdlib.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -212,6 +214,13 @@ struct tcp_server {
     bool durable;
     bool journal;
     bool storage_failed; /* Read by accept thread only after joining workers. */
+    bool snapshot_mode; /* in-memory opt-in only; never enable with durable/WAL */
+    raft_install_receiver_t incoming;
+    uint8_t *snapshot_bytes; /* encoded snapshot, immutable while server->mutex held */
+    size_t snapshot_length;
+    raft_index_t snapshot_index;
+    raft_term_t snapshot_term;
+    uint32_t snapshot_offsets[RAFT_ELECTION_CLUSTER_SIZE];
 };
 
 /* Caller holds server->mutex. Persistence must complete BEFORE any vote,
@@ -329,6 +338,75 @@ static void process_client(int fd, tcp_server_t *server)
             (void)fflush(stdout);
         }
         /* Empty heartbeat traffic is intentionally not logged. */
+    } else if (status == RAFT_WIRE_OK && server->snapshot_mode &&
+               type == RAFT_WIRE_INSTALL_SNAPSHOT) {
+        raft_install_chunk_t chunk;
+        uint64_t now_ms=0;
+        if (raft_install_decode_chunk(payload,length,&chunk)!=RAFT_OK ||
+            raft_config_peer_for_id(&server->config,chunk.leader_id)==NULL ||
+            chunk.leader_id==server->node_id ||
+            raft_clock_monotonic_ms(&now_ms)!=RAFT_OK) return;
+        raft_install_response_t reply;
+        uint8_t response[RAFT_INSTALL_RESPONSE_BYTES];
+        uint8_t *complete=NULL; size_t complete_len=0;
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_status_t result=raft_install_receive(&server->incoming,
+            &server->vote_node,&server->kv,&chunk,now_ms,&reply,
+            &complete,&complete_len);
+        if (complete) {
+            free(server->snapshot_bytes);
+            server->snapshot_bytes=complete;
+            server->snapshot_length=complete_len;
+            server->snapshot_index=chunk.last_index;
+            server->snapshot_term=chunk.last_term;
+            raft_index_t applied=0;
+            (void)raft_apply_committed(&server->vote_node,&server->kv,&applied);
+            printf("Snapshot installed: follower=%u boundary=%llu/%llu bytes=%zu\n",
+                server->node_id,(unsigned long long)chunk.last_index,
+                (unsigned long long)chunk.last_term,complete_len);
+            (void)fflush(stdout);
+        }
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (result!=RAFT_OK ||
+            raft_install_encode_response(&reply,response)!=RAFT_OK) return;
+        (void)raft_wire_send(fd,RAFT_WIRE_INSTALL_SNAPSHOT_RESPONSE,response,
+                             sizeof(response),message,sizeof(message));
+    } else if (status == RAFT_WIRE_OK && server->snapshot_mode &&
+               type == RAFT_WIRE_SNAPSHOT_COMPACT_DEMO && length==0) {
+        uint8_t response[17]={0};
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_node_t *node=&server->vote_node;
+        raft_snapshot_t shot;
+        raft_snapshot_init(&shot);
+        uint8_t *encoded=NULL; size_t encoded_len=0;
+        int accepted=node->role==RAFT_LEADER && node->last_applied &&
+            node->last_applied>node->log.base_index &&
+            raft_snapshot_capture(node,&server->kv,&shot)==RAFT_OK &&
+            raft_snapshot_encode(&shot,&encoded,&encoded_len)==RAFT_OK &&
+            raft_snapshot_compact_applied(node,&shot)==RAFT_OK;
+        if (accepted) {
+            free(server->snapshot_bytes);
+            server->snapshot_bytes=encoded;
+            server->snapshot_length=encoded_len;
+            server->snapshot_index=shot.last_index;
+            server->snapshot_term=shot.last_term;
+            memset(server->snapshot_offsets,0,sizeof(server->snapshot_offsets));
+            printf("Snapshot compacted: leader=%u boundary=%llu/%llu bytes=%zu\n",
+                server->node_id,(unsigned long long)shot.last_index,
+                (unsigned long long)shot.last_term,encoded_len);
+            (void)fflush(stdout);
+        } else free(encoded);
+        raft_index_t index=node->log.base_index;
+        raft_term_t term=node->log.base_term;
+        (void)pthread_mutex_unlock(&server->mutex);
+        raft_snapshot_destroy(&shot);
+        for(unsigned b=0;b<8;b++) {
+            response[b]=(uint8_t)(index>>(56u-8u*b));
+            response[8+b]=(uint8_t)(term>>(56u-8u*b));
+        }
+        response[16]=(uint8_t)accepted;
+        (void)raft_wire_send(fd,RAFT_WIRE_SNAPSHOT_COMPACT_RESPONSE,response,
+                             sizeof(response),message,sizeof(message));
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_DEMO_PROPOSE &&
                length != 0 && length <= 1024) {
         /* Explicitly educational, unauthenticated command injection.
@@ -476,6 +554,7 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     memset(server, 0, sizeof(*server));
     server->node_id = node_id;
     raft_kv_init(&server->kv);
+    raft_install_receiver_init(&server->incoming);
     atomic_init(&server->election_stop, false);
     server->storage.directory_fd = -1;
     server->storage.lock_fd = -1;
@@ -567,6 +646,8 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
     }
     if (server->journal) raft_wal_close(&server->wal);
     raft_storage_close(&server->storage);
+    raft_install_receiver_destroy(&server->incoming);
+    free(server->snapshot_bytes);
     raft_kv_destroy(&server->kv);
     raft_node_destroy(&server->vote_node);
     (void)pthread_cond_destroy(&server->worker_changed);
@@ -639,6 +720,32 @@ static int send_peer_replication(const raft_peer_config_t *peer,
            raft_append_decode_response(reply, reply_length, response) == RAFT_OK ? 0 : -1;
 }
 
+/* Each chunk is its own framed request on a new short-lived TCP connection.
+ * The follower returns the next expected offset to recover lost acknowledgements. */
+static int send_peer_snapshot(const raft_peer_config_t *peer,
+                              const uint8_t *payload, size_t length,
+                              raft_install_response_t *response)
+{
+    char error[256];
+    int fd=raft_tcp_connect(peer,RAFT_HEARTBEAT_CONNECT_MS,error,sizeof(error));
+    if (fd<0) return -1;
+    struct timeval timeout={.tv_sec=0,.tv_usec=RAFT_HEARTBEAT_IO_TIMEOUT_US};
+    if (setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0 ||
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0) {
+        (void)close(fd); return -1;
+    }
+    raft_wire_status_t result=raft_wire_send(fd,RAFT_WIRE_INSTALL_SNAPSHOT,
+                                payload,length,error,sizeof(error));
+    uint8_t reply[RAFT_INSTALL_RESPONSE_BYTES];
+    raft_wire_type_t type=RAFT_WIRE_PING; size_t reply_length=0;
+    if (result==RAFT_WIRE_OK)
+        result=raft_wire_recv(fd,&type,reply,sizeof(reply),&reply_length,
+                              error,sizeof(error));
+    (void)close(fd);
+    return result==RAFT_WIRE_OK && type==RAFT_WIRE_INSTALL_SNAPSHOT_RESPONSE &&
+        raft_install_decode_response(reply,reply_length,response)==RAFT_OK ? 0 : -1;
+}
+
 static void *election_worker_main(void *argument)
 {
     tcp_server_t *server = argument;
@@ -682,20 +789,47 @@ static void *election_worker_main(void *argument)
                 raft_append_batch_t batch;
                 raft_index_t sent_through = 0;
                 size_t payload_length = 0;
+                size_t entries=0;
+                bool sending_snapshot=false;
+                raft_index_t selected_index=0;
+                uint32_t selected_offset=0, selected_total=0, sent_bytes=0;
                 (void)pthread_mutex_lock(&server->mutex);
                 bool valid = server->vote_node.role == RAFT_LEADER &&
                     server->vote_node.current_term == heartbeat_term &&
                     server->progress[i].term == heartbeat_term &&
-                    server->progress[i].peer_id == peer->id &&
-                    raft_replication_prepare(&server->vote_node,
-                        &server->progress[i], &batch, &sent_through) == RAFT_OK &&
-                    raft_append_encode_batch(&batch, payload, sizeof(payload),
-                                             &payload_length) == RAFT_OK;
-                size_t entries = valid ? batch.entry_count : 0;
+                    server->progress[i].peer_id == peer->id;
+                if (valid && server->snapshot_mode && server->snapshot_bytes &&
+                    server->progress[i].next_index<=server->vote_node.log.base_index) {
+                    sending_snapshot=true;
+                    selected_index=server->snapshot_index;
+                    selected_total=(uint32_t)server->snapshot_length;
+                    selected_offset=server->snapshot_offsets[i];
+                    if (selected_offset>=selected_total) selected_offset=0;
+                    size_t remaining=selected_total-selected_offset;
+                    sent_bytes=(uint32_t)(remaining>RAFT_INSTALL_CHUNK_BYTES ?
+                                             RAFT_INSTALL_CHUNK_BYTES : remaining);
+                    raft_install_chunk_t chunk={heartbeat_term,server->node_id,
+                        selected_index,server->snapshot_term,selected_offset,
+                        selected_total,selected_offset+sent_bytes==selected_total,
+                        server->snapshot_bytes+selected_offset,sent_bytes};
+                    valid=raft_install_encode_chunk(&chunk,payload,sizeof(payload),
+                                                     &payload_length)==RAFT_OK;
+                } else if (valid) {
+                    valid=raft_replication_prepare(&server->vote_node,
+                        &server->progress[i],&batch,&sent_through)==RAFT_OK &&
+                        raft_append_encode_batch(&batch,payload,sizeof(payload),
+                                                 &payload_length)==RAFT_OK;
+                    entries=valid ? batch.entry_count : 0;
+                }
                 (void)pthread_mutex_unlock(&server->mutex);
                 if (!valid) break;
                 raft_append_response_t reply;
-                if (send_peer_replication(peer, payload, payload_length, &reply) != 0)
+                raft_install_response_t snap_reply={0};
+                if (sending_snapshot) {
+                    if (send_peer_snapshot(peer,payload,payload_length,&snap_reply)!=0)
+                        continue;
+                    reply=(raft_append_response_t){snap_reply.term,snap_reply.accepted};
+                } else if (send_peer_replication(peer,payload,payload_length,&reply)!=0)
                     continue; /* network failure retains nextIndex for retry */
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
@@ -706,8 +840,38 @@ static void *election_worker_main(void *argument)
                 bool still_leader = server->vote_node.role == RAFT_LEADER &&
                     server->vote_node.current_term == heartbeat_term;
                 if (still_leader) {
-                    (void)raft_replication_observe(&server->progress[i],
-                                                    sent_through, &reply);
+                    if (sending_snapshot) {
+                        if (selected_index==server->snapshot_index &&
+                            selected_total==server->snapshot_length &&
+                            snap_reply.next_offset<=selected_total &&
+                            (!snap_reply.accepted ||
+                             (snap_reply.next_offset==selected_offset+sent_bytes ||
+                              snap_reply.next_offset==selected_total))) {
+                            server->snapshot_offsets[i]=snap_reply.next_offset;
+                            if (snap_reply.accepted &&
+                                snap_reply.next_offset==selected_total) {
+                                if (server->progress[i].match_index<selected_index)
+                                    server->progress[i].match_index=selected_index;
+                                if (server->progress[i].next_index<selected_index+1)
+                                    server->progress[i].next_index=selected_index+1;
+                                printf("Snapshot acknowledged: leader=%u follower=%u boundary=%llu\n",
+                                    server->node_id,peer->id,
+                                    (unsigned long long)selected_index);
+                                (void)fflush(stdout);
+                            }
+                        } else server->snapshot_offsets[i]=0;
+                    } else {
+                        (void)raft_replication_observe(&server->progress[i],
+                                                       sent_through,&reply);
+                        /* A complete checkpoint supersedes retrying already
+                         * discarded prefixes. Install it on an older peer
+                         * rather than waiting through O(prefix_length)
+                         * failed prevIndex probes and follower elections. */
+                        if (server->snapshot_mode && server->snapshot_bytes &&
+                            !reply.success &&
+                            server->progress[i].next_index > server->snapshot_index)
+                            server->progress[i].next_index=server->snapshot_index;
+                    }
                     /* Successful same-term AppendEntries acknowledgements
                      * may move the majority-backed commit index. All node
                      * and peer progress fields remain under the same mutex. */
@@ -782,6 +946,7 @@ static void *election_worker_main(void *argument)
                         (void)raft_replication_progress_init(&server->progress[j],
                               id, server->vote_node.current_term, last);
                     }
+                    memset(server->snapshot_offsets,0,sizeof(server->snapshot_offsets));
                     next_heartbeat_ms = 0; /* send first AppendEntries next loop */
                 }
                 bool continuing = server->vote_node.role == RAFT_CANDIDATE &&
@@ -800,7 +965,7 @@ static void *election_worker_main(void *argument)
 
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
-                          const char *durable_directory, bool journal,
+                          const char *durable_directory, bool journal, bool snapshots,
                           char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
@@ -812,7 +977,10 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
 
     tcp_server_t server;
     int code = tcp_server_init(&server, config->node_id);
-    if (code == 0) server.config = *config;
+    if (code == 0) {
+        server.config = *config;
+        server.snapshot_mode = snapshots;
+    }
     if (code != 0) {
         report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
         (void)close(listener);
@@ -990,13 +1158,13 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, NULL, false, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, false, false, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, NULL, false, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, false, false, error, error_capacity);
 }
 
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
@@ -1006,7 +1174,7 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
         report_error(error, capacity, "durable directory is required");
         return -1;
     }
-    return tcp_serve_mode(config, 0, true, directory, false, error, capacity);
+    return tcp_serve_mode(config, 0, true, directory, false, false, error, capacity);
 }
 
 int raft_tcp_elect_wal(const raft_cluster_config_t *config,
@@ -1016,5 +1184,11 @@ int raft_tcp_elect_wal(const raft_cluster_config_t *config,
         report_error(error,capacity,"WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,true,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,true,false,error,capacity);
+}
+
+int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
+                            char *error, size_t capacity)
+{
+    return tcp_serve_mode(config,0,true,NULL,false,true,error,capacity);
 }

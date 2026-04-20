@@ -51,4 +51,8 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
 int raft_tcp_elect_wal(const raft_cluster_config_t *config,
                        const char *directory, char *error, size_t capacity);
 
+/* Phase 20 in-memory snapshot transfer, intentionally separate from durable/WAL. */
+int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
+                            char *error, size_t capacity);
+
 #endif /* RAFT_TCP_H */

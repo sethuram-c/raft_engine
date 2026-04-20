@@ -773,3 +773,49 @@ index/term, and live leaders must not trim without peer catch-up support.
 Those features are postponed. The demo saves a separate snapshot file, trims
 only its local test log, and restores into a *fresh* in-memory node before
 applying a retained suffix. CRC32 is not authentication.
+
+
+## Phase 20: InstallSnapshot over bounded TCP frames
+
+The optional `--elect-snapshot` mode enables live in-memory leader prefix
+compaction and snapshot transfer. A separate snapshot module `raft_install.c`
+provides protocol codec and follower reception; it is never used by the
+`--elect-durable` or `--elect-wal` modes, whose existing full-prefix storage
+formats would otherwise be unsafe for compacted logs.
+
+Request body (big endian; at most 4096 bytes):
+
+| Offset | Size | Field |
+|---|---:|---|
+| 0 | 8 | `term` |
+| 8 | 4 | `leader_id` |
+| 12 | 8 | `last_included_index` |
+| 20 | 8 | `last_included_term` |
+| 28 | 4 | `offset` |
+| 32 | 4 | `total_snapshot_bytes` (at most 256 KiB) |
+| 36 | 1 | `done` (0/1) |
+| 37 | 1 | reserved (must be zero) |
+| 38 | 2 | data length |
+| 40 | variable | snapshot bytes including Phase 19 CRC32 |
+
+Response body: `term:u64`, `accepted:u8`, `next_offset:u32` (13 bytes).
+
+All memory in the installation receiver, including partial bytes and metadata,
+is guarded by the TCP server's existing node mutex. Chunks are validated,
+assembled in-order, and rejected or retried on offset disagreement. Snapshot
+CRC32 and embedded `(index, term)` are validated before mutation. A matching
+local suffix is retained; a conflicting suffix is removed only if it cannot
+contain already committed entries. `lastApplied` advances to the snapshot
+boundary, then eligible suffix entries are applied. A repeated completed
+snapshot is idempotent. Higher terms trigger follower step-down.
+
+The leader retains a cached encoded snapshot, emits one chunk per heartbeat
+iteration per lagging peer, and uses acknowledgements to advance its transfer
+offset. After a complete acknowledgement, `matchIndex` moves to the boundary
+and AppendEntries resumes. Lost responses or follower restarts can cause
+retransmission, and incomplete transfers remain in memory only.
+
+**Non-goals:** authentication, chunk streaming to disk, startup reinstallation,
+WAL format migration, joint consensus/membership changes, production client
+API, and linearizable reads. The teaching-only compaction RPC must not be
+exposed outside trusted localhost test environments.
