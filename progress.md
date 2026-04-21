@@ -667,3 +667,42 @@ git commit -m "feat: transfer raft snapshots to lagging followers over TCP"
 educational. Full crash-safe snapshots integrated with WAL are not implemented.
 
 **Next:** Phase 21 — Snapshot/WAL generation consistency and crash recovery.
+
+
+## Phase 21 / 35 — Snapshot/WAL Generation Consistency and Crash Recovery
+
+- [x] Define isolated snapshot-aware WAL v1 format, separate from Phase 16-18.
+- [x] Persist snapshot bytes, `(baseIndex,baseTerm)`, consensus metadata,
+      and retained suffix in one CRC-validated atomic checkpoint generation.
+- [x] Append `fsync`ed incremental metadata/log-suffix journal deltas between
+      checkpoints, and periodically consolidate the history.
+- [x] Acknowledge InstallSnapshot completion or leader compaction only after
+      an atomic combined checkpoint succeeds; fail-stop on storage failure.
+- [x] Recover snapshot KV, replay committed suffix, leave uncommitted unseen.
+- [x] Refuse corrupt complete frames, truncate torn final records, ignore
+      orphan temp checkpoints, and lock the writer per node.
+- [x] Preserve Phase 1–20 public modes and comprehensive legacy unit tests.
+- [x] Unit tests and multi-process `SIGKILL`/restart integration tests.
+- [ ] Run on Fedora, inspect staged diff, commit with actual work date.
+
+### Phase 21 acceptance commands
+
+```sh
+make clean && make && make test
+./build/test_raft_snapwal
+python3 tests/test_snapwal_integration.py ./build/raft-engine
+```
+
+### Phase 21 Git staging (all new or changed files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_snapwal.h include/raft_tcp.h \
+  src/raft_snapwal.c src/raft_tcp.c src/main.c \
+  tests/test_raft_snapwal.c tests/test_snapwal_integration.py
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: coordinate Raft snapshots with crash-safe WAL generations"
+```
+
+**Next:** Phase 22 — client request semantics and committed write acknowledgements.

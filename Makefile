@@ -7,7 +7,7 @@ LDLIBS ?=
 PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
@@ -27,6 +27,7 @@ TEST_WAL = build/test_raft_wal
 TEST_CHECKPOINT = build/test_raft_checkpoint
 TEST_SNAPSHOT = build/test_raft_snapshot
 TEST_INSTALL = build/test_raft_install
+TEST_SNAPWAL = build/test_raft_snapwal
 
 .PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
@@ -88,6 +89,9 @@ $(TEST_SNAPSHOT): tests/test_raft_snapshot.c src/raft_snapshot.c src/raft_state_
 $(TEST_INSTALL): tests/test_raft_install.c src/raft_install.c src/raft_snapshot.c src/raft_state_machine.c src/raft_log.c src/raft_node.c src/raft_timer.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_install.c src/raft_install.c src/raft_snapshot.c src/raft_state_machine.c src/raft_log.c src/raft_node.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
 
+$(TEST_SNAPWAL): tests/test_raft_snapwal.c src/raft_snapwal.c src/raft_storage.c src/raft_snapshot.c src/raft_state_machine.c src/raft_node.c src/raft_log.c src/raft_timer.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_snapwal.c src/raft_snapwal.c src/raft_storage.c src/raft_snapshot.c src/raft_state_machine.c src/raft_node.c src/raft_log.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
+
 build:
 	mkdir -p build
 
@@ -107,7 +111,7 @@ check-config: $(APP)
 test-smoke: $(APP)
 	sh tests/test_smoke.sh ./$(APP)
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL)
+test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL) $(TEST_SNAPWAL)
 	./$(TEST_LOG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
@@ -126,6 +130,7 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_CHECKPOINT)
 	./$(TEST_SNAPSHOT)
 	./$(TEST_INSTALL)
+	./$(TEST_SNAPWAL)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -142,6 +147,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_wal_integration.py ./$(APP)
 	$(PYTHON) tests/test_checkpoint_integration.py ./$(APP)
 	$(PYTHON) tests/test_install_integration.py ./$(APP)
+	$(PYTHON) tests/test_snapwal_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

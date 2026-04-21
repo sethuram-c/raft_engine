@@ -55,4 +55,8 @@ int raft_tcp_elect_wal(const raft_cluster_config_t *config,
 int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
                             char *error, size_t capacity);
 
+/* Phase 21: opt-in crash-safe InstallSnapshot+WAL generation format. */
+int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
+                               const char *directory, char *error, size_t capacity);
+
 #endif /* RAFT_TCP_H */

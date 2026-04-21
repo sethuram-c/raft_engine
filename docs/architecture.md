@@ -819,3 +819,54 @@ retransmission, and incomplete transfers remain in memory only.
 WAL format migration, joint consensus/membership changes, production client
 API, and linearizable reads. The teaching-only compaction RPC must not be
 exposed outside trusted localhost test environments.
+
+
+## Phase 21: coordinated snapshot-aware WAL (separate opt-in format)
+
+`--elect-snapshot-wal CONFIG DATA_DIR` uses `raft_snapwal.c` and a new
+per-node `node-ID.snapwal` file. A single journal file provides a recovery
+**generation**: its first CRC-protected record is a full checkpoint carrying
+`term`, `votedFor`, `commitIndex`, virtual log `(baseIndex, baseTerm)`,
+the exact Phase 19 encoded KV snapshot and the retained log suffix. The
+checkpoint and the suffix are deliberately **not** separate independently
+renamed files. Between checkpoints, `raft_snapwal_save` appends bounded,
+CRC-protected records containing metadata and only the changed suffix.
+
+On-disk format, all integers big-endian:
+
+- Header (20 bytes): magic `RAFT21WL` [8], version [4], node ID [4], CRC32 [4].
+- Every record: payload length [4], payload CRC32 [4], payload [variable].
+- Payload fixed prefix (60 bytes): sequence [8]; mode [1] (1=checkpoint,
+  2=delta); reserved [3]; currentTerm [8]; votedFor [4]; commitIndex [8];
+  baseIndex [8]; baseTerm [8]; retained-prefix-count `keep` [4]; number of
+  newly encoded suffix entries [4]; snapshot length [4].
+- Checkpoint records embed a complete snapshot (if baseIndex > 0). Each
+  appended entry encodes term [8], length [4], command bytes [length].
+- A checkpoint has sequence=1 and keep=0; subsequent deltas increment the
+  sequence. A delta cannot alter the base index/term or snapshot bytes.
+
+A new generation is written under the existing exclusive per-node lock:
+serialize -> write `node-ID.snapwal.tmp` -> file fsync -> atomic rename ->
+directory fsync. The old complete generation or the new complete generation
+remains independently replayable across rename boundaries. If the storage
+call fails after an ambiguous rename/fsync outcome, the node halts instead
+of acknowledging an unrecorded consensus state. An orphan, not-renamed temp
+is discarded at startup; only a torn FINAL record in the active journal may
+be truncated and fsynced. Complete CRC or semantic errors reject startup.
+
+Installed snapshot handling calls the same `raft_install_receive` algorithm,
+but the server must persist the **combined** post-install state before
+sending the final successful chunk acknowledgement. Local leader compaction
+also durably checkpoints before reporting success. A partially received
+snapshot remains in memory until validated and is not a recovery generation.
+
+Recovery loads the snapshot byte stream in the same journal as metadata and
+suffix, verifies the matching included `(index, term)` boundary, restores KV
+state, then applies committed retained entries in increasing absolute index
+order. Uncommitted suffix commands are never replayed into the KV store.
+
+**Explicit compatibility boundary:** the Phase 16 single-file image and
+Phase 17/18 WAL formats still disallow compacted bases. The new option uses
+its own file name/magic and rejects accidental identity reuse in an existing
+old-format directory. No automatic migration, production authentication,
+TLS, full fault-injection matrix, or actual power-loss testing is claimed.

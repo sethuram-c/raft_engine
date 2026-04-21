@@ -10,6 +10,7 @@
 #include "raft_state_machine.h"
 #include "raft_storage.h"
 #include "raft_wal.h"
+#include "raft_snapwal.h"
 #include "raft_install.h"
 #include <stdlib.h>
 
@@ -211,10 +212,12 @@ struct tcp_server {
     raft_replication_progress_t progress[RAFT_ELECTION_CLUSTER_SIZE];
     raft_storage_t storage;
     raft_wal_t wal;
+    raft_snapwal_t snapwal;
+    bool snapshot_journal;
     bool durable;
     bool journal;
     bool storage_failed; /* Read by accept thread only after joining workers. */
-    bool snapshot_mode; /* in-memory opt-in only; never enable with durable/WAL */
+    bool snapshot_mode; /* in-memory or opt-in coordinated snapshot WAL */
     raft_install_receiver_t incoming;
     uint8_t *snapshot_bytes; /* encoded snapshot, immutable while server->mutex held */
     size_t snapshot_length;
@@ -228,12 +231,15 @@ struct tcp_server {
  * A write failure is fail-stop: no unrecorded consensus decision is exposed. */
 static int durable_checkpoint(tcp_server_t *server)
 {
-    if (!server->durable && !server->journal) return 0;
+    if (!server->durable && !server->journal && !server->snapshot_journal) return 0;
     char error[256];
-    if ((server->journal ? raft_wal_save(&server->wal, &server->vote_node,
-                              error, sizeof(error)) :
-             raft_storage_save(&server->storage, &server->vote_node,
-                              error, sizeof(error))) == 0) return 0;
+    if ((server->snapshot_journal ?
+             raft_snapwal_save(&server->snapwal, &server->vote_node,
+                               error, sizeof(error)) :
+             (server->journal ? raft_wal_save(&server->wal, &server->vote_node,
+                               error, sizeof(error)) :
+              raft_storage_save(&server->storage, &server->vote_node,
+                               error, sizeof(error)))) == 0) return 0;
     fprintf(stderr, "FATAL durable storage failure, halting: %s\n", error);
     server->storage_failed = true;
     atomic_store(&server->election_stop, true);
@@ -353,6 +359,25 @@ static void process_client(int fd, tcp_server_t *server)
         raft_status_t result=raft_install_receive(&server->incoming,
             &server->vote_node,&server->kv,&chunk,now_ms,&reply,
             &complete,&complete_len);
+        /* InstallSnapshot mutates the in-memory node. Never acknowledge the
+         * completed installation until snapshot+suffix+metadata have reached
+         * one durable generation. A failure is fatal to this process. */
+        if (complete && server->snapshot_journal &&
+            raft_snapwal_checkpoint(&server->snapwal, &server->vote_node,
+                                    complete, complete_len, message,
+                                    sizeof(message)) != 0) {
+            fprintf(stderr, "FATAL snapshot installation persistence: %s\n", message);
+            server->storage_failed=true;
+            atomic_store(&server->election_stop,true);
+            stop_requested=1;
+            result=RAFT_ERR_INVALID_ARGUMENT;
+            free(complete);
+            complete=NULL;
+        }
+        if (!complete && result==RAFT_OK && server->snapshot_journal &&
+            (server->vote_node.current_term != server->snapwal.previous.current_term ||
+             server->vote_node.voted_for != server->snapwal.previous.voted_for) &&
+            durable_checkpoint(server)!=0) result=RAFT_ERR_INVALID_ARGUMENT;
         if (complete) {
             free(server->snapshot_bytes);
             server->snapshot_bytes=complete;
@@ -384,6 +409,15 @@ static void process_client(int fd, tcp_server_t *server)
             raft_snapshot_capture(node,&server->kv,&shot)==RAFT_OK &&
             raft_snapshot_encode(&shot,&encoded,&encoded_len)==RAFT_OK &&
             raft_snapshot_compact_applied(node,&shot)==RAFT_OK;
+        if (accepted && server->snapshot_journal &&
+            raft_snapwal_checkpoint(&server->snapwal, node, encoded,
+                                    encoded_len, message, sizeof(message)) != 0) {
+            fprintf(stderr, "FATAL snapshot checkpoint persistence: %s\n", message);
+            server->storage_failed=true;
+            atomic_store(&server->election_stop,true);
+            stop_requested=1;
+            accepted=0;
+        }
         if (accepted) {
             free(server->snapshot_bytes);
             server->snapshot_bytes=encoded;
@@ -558,6 +592,9 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
     atomic_init(&server->election_stop, false);
     server->storage.directory_fd = -1;
     server->storage.lock_fd = -1;
+    server->snapwal.fd = -1;
+    server->snapwal.lock.directory_fd = -1;
+    server->snapwal.lock.lock_fd = -1;
     server->wal.fd = -1;
     server->wal.lock.directory_fd = -1;
     server->wal.lock.lock_fd = -1;
@@ -644,6 +681,7 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
             server->workers[i].in_use = false;
         }
     }
+    if (server->snapshot_journal) raft_snapwal_close(&server->snapwal);
     if (server->journal) raft_wal_close(&server->wal);
     raft_storage_close(&server->storage);
     raft_install_receiver_destroy(&server->incoming);
@@ -966,7 +1004,7 @@ static void *election_worker_main(void *argument)
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
                           const char *durable_directory, bool journal, bool snapshots,
-                          char *error, size_t error_capacity)
+                          bool snapshot_journal, char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
         return -1;
@@ -980,6 +1018,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
     if (code == 0) {
         server.config = *config;
         server.snapshot_mode = snapshots;
+        server.snapshot_journal = snapshot_journal;
     }
     if (code != 0) {
         report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
@@ -987,6 +1026,15 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         return -1;
     }
     if (durable_directory != NULL) {
+        if (snapshot_journal &&
+            raft_snapwal_open(&server.snapwal,durable_directory,config->node_id,
+                              error,error_capacity)!=0) {
+            (void)close(listener);
+            /* The open helper closed its partially initialized descriptor. */
+            server.snapshot_journal=false;
+            stop_and_join_workers(&server,false);
+            return -1;
+        }
         if (journal) {
             if (raft_wal_open(&server.wal,durable_directory,config->node_id,
                               error,error_capacity)!=0) {
@@ -996,29 +1044,61 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             }
             server.journal=true;
         }
-        if (!journal && raft_storage_open(&server.storage, durable_directory, config->node_id,
+        if (!journal && !snapshot_journal && raft_storage_open(&server.storage, durable_directory, config->node_id,
                               error, error_capacity) != 0) {
             (void)close(listener);
             stop_and_join_workers(&server, false);
             return -1;
         }
-        server.durable = !journal;
+        server.durable = !journal && !snapshot_journal;
         int found = 0;
-        if ((journal ? raft_wal_load(&server.wal,&server.vote_node,&found,
-                                    error,error_capacity) :
-             raft_storage_load(&server.storage, &server.vote_node, &found,
-                              error, error_capacity)) != 0) {
+        uint8_t *restored_snapshot=NULL;
+        size_t restored_length=0;
+        if ((snapshot_journal ?
+             raft_snapwal_load(&server.snapwal, &server.vote_node, &found,
+                               &restored_snapshot, &restored_length,
+                               error,error_capacity) :
+             (journal ? raft_wal_load(&server.wal,&server.vote_node,&found,
+                                     error,error_capacity) :
+              raft_storage_load(&server.storage, &server.vote_node, &found,
+                               error, error_capacity))) != 0) {
             (void)close(listener);
             stop_and_join_workers(&server, false);
             return -1; /* corrupt durable state must NOT be replaced */
         }
+        if (snapshot_journal && restored_length) {
+            raft_snapshot_t snapshot;
+            raft_snapshot_init(&snapshot);
+            raft_node_t fresh;
+            (void)raft_node_init(&fresh,server.node_id);
+            fresh.current_term=server.vote_node.current_term;
+            int ok=raft_snapshot_decode(restored_snapshot,restored_length,
+                                        &snapshot)==RAFT_OK &&
+                   snapshot.last_index==server.vote_node.log.base_index &&
+                   snapshot.last_term==server.vote_node.log.base_term &&
+                   raft_snapshot_restore_fresh(&snapshot,&fresh,&server.kv)==RAFT_OK;
+            if (ok) server.vote_node.last_applied=snapshot.last_index;
+            raft_node_destroy(&fresh);
+            raft_snapshot_destroy(&snapshot);
+            if (!ok) {
+                report_error(error,error_capacity,"snapshot WAL recovery state mismatch");
+                free(restored_snapshot);
+                (void)close(listener);
+                stop_and_join_workers(&server,false);
+                return -1;
+            }
+            server.snapshot_bytes=restored_snapshot;
+            server.snapshot_length=restored_length;
+            server.snapshot_index=server.vote_node.log.base_index;
+            server.snapshot_term=server.vote_node.log.base_term;
+        } else free(restored_snapshot);
         uint64_t now = 0;
         raft_index_t replayed = 0;
         if (raft_clock_monotonic_ms(&now) != RAFT_OK ||
             raft_node_start_follower(&server.vote_node, now,
                      0x9E3779B9u ^ config->node_id ^ (uint32_t)getpid() ^ (uint32_t)now) != RAFT_OK ||
             raft_apply_committed(&server.vote_node, &server.kv, &replayed) != RAFT_OK ||
-            (!found && !journal && raft_storage_save(&server.storage, &server.vote_node,
+            (!found && !journal && !snapshot_journal && raft_storage_save(&server.storage, &server.vote_node,
                                          error, error_capacity) != 0)) {
             if (error && error_capacity && error[0] == '\0')
                 report_error(error, error_capacity, "could not restore durable state");
@@ -1027,7 +1107,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             return -1;
         }
         printf("%s recovery: node=%u restored=%d term=%llu log=%llu commit=%llu\n",
-               journal ? "WAL" : "Durable",
+               snapshot_journal ? "Snapshot-WAL" : (journal ? "WAL" : "Durable"),
                config->node_id, found,
                (unsigned long long)server.vote_node.current_term,
                (unsigned long long)raft_log_last_index(&server.vote_node.log),
@@ -1158,13 +1238,13 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, NULL, false, false, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, false, false, false, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, NULL, false, false, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, false, false, false, error, error_capacity);
 }
 
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
@@ -1174,7 +1254,7 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
         report_error(error, capacity, "durable directory is required");
         return -1;
     }
-    return tcp_serve_mode(config, 0, true, directory, false, false, error, capacity);
+    return tcp_serve_mode(config, 0, true, directory, false, false, false, error, capacity);
 }
 
 int raft_tcp_elect_wal(const raft_cluster_config_t *config,
@@ -1184,11 +1264,21 @@ int raft_tcp_elect_wal(const raft_cluster_config_t *config,
         report_error(error,capacity,"WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,true,false,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,true,false,false,error,capacity);
 }
 
 int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
                             char *error, size_t capacity)
 {
-    return tcp_serve_mode(config,0,true,NULL,false,true,error,capacity);
+    return tcp_serve_mode(config,0,true,NULL,false,true,false,error,capacity);
+}
+
+int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
+                               const char *directory, char *error, size_t capacity)
+{
+    if (!directory || !*directory) {
+        report_error(error, capacity, "snapshot WAL directory is required");
+        return -1;
+    }
+    return tcp_serve_mode(config,0,true,directory,false,true,true,error,capacity);
 }

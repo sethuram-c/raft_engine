@@ -2,7 +2,46 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 20 / 35 — InstallSnapshot RPC & Lagging-Follower Catch-Up.**
+**Current milestone: Phase 21 / 35 — Snapshot/WAL Generation Consistency and Crash Recovery.**
+
+Phase 21 introduces a **separate, opt-in** `--elect-snapshot-wal` mode that
+persists Raft consensus metadata, compacted snapshot bytes, and the retained
+log suffix in **one atomic checkpoint generation**. Between generation
+checkpoints, term/vote/commit and log-suffix changes are appended to the
+checksummed journal and `fsync`ed before acknowledgment. Startup validates
+and replays the checkpoint and journal, reconstructs the snapshot KV state,
+then applies any committed entries after the compacted boundary. A completed
+InstallSnapshot or leader compaction is acknowledged only after its combined
+checkpoint is durable; storage failures cause a fail-stop.
+
+### Phase 21 quickstart (fresh, separate directory)
+
+```sh
+make clean && make && make test
+./build/test_raft_snapwal
+python3 tests/test_snapwal_integration.py ./build/raft-engine
+
+# Run each in a different terminal; do NOT mix with Phase 16-18 data.
+./build/raft-engine --elect-snapshot-wal config/node1.conf data-phase21
+./build/raft-engine --elect-snapshot-wal config/node2.conf data-phase21
+./build/raft-engine --elect-snapshot-wal config/node3.conf data-phase21
+
+# Discover the leader, then submit and commit proposals before compaction:
+./build/raft-engine --status config/node1.conf 2
+./build/raft-engine --propose-demo config/node1.conf 2 'SET alpha 1'
+./build/raft-engine --snapshot-compact-demo config/node1.conf 2
+```
+
+Each identity uses `data-phase21/node-ID.snapwal` plus the shared node-ID
+lock. These new files **cannot** be passed to `--elect-wal` or
+`--elect-durable`, and old journals are not automatically migrated.
+
+**Trust and limitations:** This is still an educational engine. Development
+RPCs are unauthenticated and not suitable for an untrusted network; no
+linearizable client API, log-install streaming to disk, power-cut simulation,
+production durability audit, or generalized membership. CRC32 detects
+accidental corruption but is not a MAC. Tested crashes use `SIGKILL` and
+controlled on-disk corruption; real storage hardware guarantees vary.
 
 Phase 20 introduces a separate, **in-memory only** `--elect-snapshot` cluster mode.
 After quorum commitment and local application, a development-only administrative
