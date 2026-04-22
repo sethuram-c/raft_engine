@@ -870,3 +870,35 @@ Phase 17/18 WAL formats still disallow compacted bases. The new option uses
 its own file name/magic and rejects accidental identity reuse in an existing
 old-format directory. No automatic migration, production authentication,
 TLS, full fault-injection matrix, or actual power-loss testing is claimed.
+
+
+## Phase 22: Commit-aware client writes
+
+The framed transport now recognizes `CLIENT_WRITE` (21) and
+`CLIENT_WRITE_RESPONSE` (22). The request contains a big-endian
+`timeoutMs:u32` (100–3000) followed by 1–1024 bytes of raw command data.
+Commands are limited to valid `SET key value` and `DEL key`, with the same
+key grammar as the deterministic state machine. The response is
+`term:u64 || index:u64 || status:u8` (17 bytes, all integers big-endian).
+
+Status codes: 0 COMMITTED, 1 NOT_LEADER, 2 TIMEOUT, 3 REJECTED, 4 UNKNOWN.
+Status 5 PENDING exists only in the internal C implementation and is never
+emitted. No leader hint or automatic redirect is implemented.
+
+The TCP worker locks the node, validates leadership and the command, appends
+an entry, and performs the existing durable/WAL checkpoint operation before
+waiting. It then releases the mutex and checks roughly every 20 ms for
+`commitIndex >= proposedIndex`, retaining the original term/index. A success
+is possible only if the node is still leader in that term and the entry has
+not been replaced. If a step-down or storage failure makes the outcome
+uncertain, the reply is UNKNOWN. If the 100–3000 ms deadline expires,
+TIMEOUT is returned but the log entry is not removed; it may commit later.
+
+This wait holds one of eight TCP worker slots but never holds the consensus
+mutex across the wait, so the election/replication worker can advance the
+commit index. Commit and application remain distinct. The client protocol
+has no request identities or deduplication, so retry after TIMEOUT or a
+connection loss can create duplicate log entries. The KV operations SET/DEL
+are idempotent as state assignments/deletions, but their log entries and
+command counts are not deduplicated. Linearizable reads, authentication,
+capacity reservation, throttling and dynamic membership remain outside scope.

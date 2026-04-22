@@ -23,4 +23,8 @@ int raft_replicate_client_demo_get(const raft_cluster_config_t *config,
                                    const uint8_t *key, size_t key_len);
 int raft_replicate_client_snapshot_compact(const raft_cluster_config_t *config,
                                            raft_node_id_t leader_id);
+/* Leader-targeted synchronous write with explicit commit vs uncertainty status. */
+int raft_replicate_client_write(const raft_cluster_config_t *config,
+                                raft_node_id_t peer_id, uint32_t timeout_ms,
+                                const uint8_t *command, size_t length);
 #endif

@@ -12,6 +12,7 @@
 #include "raft_wal.h"
 #include "raft_snapwal.h"
 #include "raft_install.h"
+#include "raft_client_write.h"
 #include <stdlib.h>
 
 #include <arpa/inet.h>
@@ -441,6 +442,64 @@ static void process_client(int fd, tcp_server_t *server)
         response[16]=(uint8_t)accepted;
         (void)raft_wire_send(fd,RAFT_WIRE_SNAPSHOT_COMPACT_RESPONSE,response,
                              sizeof(response),message,sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_CLIENT_WRITE) {
+        /* Bounded synchronous write: a reply says COMMITTED only once a
+         * majority-backed index in this leader term is committed. Neither
+         * local append nor an acknowledgement from one follower suffices.
+         * Poll outside the mutex so the election thread can replicate. */
+        raft_client_write_request_t request;
+        raft_client_write_response_t reply = {0, 0, RAFT_CLIENT_WRITE_REJECTED};
+        int valid = raft_client_write_decode_request(payload, length, &request) == 0;
+        uint64_t start_ms = 0;
+        if (valid && raft_clock_monotonic_ms(&start_ms) != RAFT_OK)
+            valid = 0;
+        if (valid) {
+            (void)pthread_mutex_lock(&server->mutex);
+            raft_node_t *node = &server->vote_node;
+            reply.term = node->current_term;
+            if (server->storage_failed) {
+                reply.status = RAFT_CLIENT_WRITE_UNKNOWN;
+            } else if (node->role != RAFT_LEADER || node->current_term == 0) {
+                reply.status = RAFT_CLIENT_WRITE_NOT_LEADER;
+            } else if (stop_requested || atomic_load(&server->election_stop)) {
+                reply.status = RAFT_CLIENT_WRITE_UNKNOWN;
+            } else if (raft_log_append(&node->log, node->current_term,
+                                       request.command, request.command_len) != RAFT_OK) {
+                reply.status = RAFT_CLIENT_WRITE_REJECTED;
+            } else {
+                reply.index = raft_log_last_index(&node->log);
+                reply.status = durable_checkpoint(server) == 0 ?
+                    RAFT_CLIENT_WRITE_PENDING : RAFT_CLIENT_WRITE_UNKNOWN;
+            }
+            (void)pthread_mutex_unlock(&server->mutex);
+            while (reply.status == RAFT_CLIENT_WRITE_PENDING) {
+                uint64_t now_ms = 0;
+                if (raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
+                    reply.status = RAFT_CLIENT_WRITE_UNKNOWN;
+                    break;
+                }
+                (void)pthread_mutex_lock(&server->mutex);
+                reply.status = server->storage_failed ? RAFT_CLIENT_WRITE_UNKNOWN :
+                    raft_client_write_check(&server->vote_node,
+                                            reply.term, reply.index);
+                (void)pthread_mutex_unlock(&server->mutex);
+                if (reply.status != RAFT_CLIENT_WRITE_PENDING) break;
+                if (stop_requested || atomic_load(&server->election_stop)) {
+                    reply.status = RAFT_CLIENT_WRITE_UNKNOWN;
+                    break;
+                }
+                if (now_ms - start_ms >= request.timeout_ms) {
+                    reply.status = RAFT_CLIENT_WRITE_TIMEOUT;
+                    break;
+                }
+                struct timespec pause = {.tv_sec = 0, .tv_nsec = 20000000L};
+                (void)nanosleep(&pause, NULL);
+            }
+        }
+        uint8_t out[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
+        if (raft_client_write_encode_response(&reply, out) == 0)
+            (void)raft_wire_send(fd, RAFT_WIRE_CLIENT_WRITE_RESPONSE, out,
+                                 sizeof(out), message, sizeof(message));
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_DEMO_PROPOSE &&
                length != 0 && length <= 1024) {
         /* Explicitly educational, unauthenticated command injection.

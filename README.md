@@ -2,9 +2,50 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 21 / 35 — Snapshot/WAL Generation Consistency and Crash Recovery.**
+**Current milestone: Phase 22 / 35 — Client Write Requests and Majority-Commit Acknowledgements.**
 
-Phase 21 introduces a **separate, opt-in** `--elect-snapshot-wal` mode that
+Phase 22 adds a bounded, leader-targeted **`--write` client operation** that returns
+`COMMITTED` only after the leader's majority-backed `commitIndex` reaches the
+new entry in the same leadership term. It accepts valid `SET` / `DEL`
+commands, rejects follower writes and malformed commands, and distinguishes
+`TIMEOUT` from `NOT_LEADER`. Timeouts are **indeterminate**: a timed-out
+entry may still commit later; there is no request-id deduplication yet.
+
+### Phase 22 quickstart
+
+```sh
+make clean && make && make test
+./build/test_raft_client_write
+python3 tests/test_client_write_integration.py ./build/raft-engine
+python3 tests/test_client_write_durable.py ./build/raft-engine
+
+# Start three nodes in separate terminals, with either --elect or
+# --elect-snapshot-wal CONFIG DATA_DIR.
+./build/raft-engine --elect config/node1.conf
+./build/raft-engine --elect config/node2.conf
+./build/raft-engine --elect config/node3.conf
+
+# Discover the current leader with --status first. For example, if
+# node 2 is leader, use node1.conf as the routing configuration:
+./build/raft-engine --write config/node1.conf 2 2500 'SET alpha hello'
+```
+
+Exit codes: `0=COMMITTED`, `2=NOT_LEADER`, `3=TIMEOUT/UNKNOWN`,
+`4=REJECTED`, `1=transport/protocol/CLI failure`. The `--write` command does
+not retry or redirect automatically. A transport error can also conceal a
+committed write. Status reports refer to **commit**, not necessarily local
+state-machine application or a durable read. The server has an eight-worker
+limit; long waits can occupy all worker slots for at most 3 seconds each.
+
+**Security:** Client RPCs remain unauthenticated, and the CLI may not connect
+using the target node's own identity configuration. Use a different configured
+node's `.conf` to address the target. This is a trusted-lab interface, not a
+production database client. State-machine table-full operations remain
+committed no-ops; the response does not guarantee that a key was stored.
+
+---
+
+**Previously (Phase 21):** Phase 21 introduces a **separate, opt-in** `--elect-snapshot-wal` mode that
 persists Raft consensus metadata, compacted snapshot bytes, and the retained
 log suffix in **one atomic checkpoint generation**. Between generation
 checkpoints, term/vote/commit and log-suffix changes are appended to the

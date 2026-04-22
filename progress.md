@@ -706,3 +706,43 @@ git commit -m "feat: coordinate Raft snapshots with crash-safe WAL generations"
 ```
 
 **Next:** Phase 22 — client request semantics and committed write acknowledgements.
+
+
+## Phase 22 / 35 — Client Write Requests and Commit Acknowledgements
+
+- [x] Add version-1 framed client-write messages and strict command/timeout parsing.
+- [x] Accept commands only on an elected leader; reject follower and malformed writes.
+- [x] Return `COMMITTED` only when original-term index is majority committed.
+- [x] Return an explicit indeterminate `TIMEOUT`/`UNKNOWN` on incomplete operations.
+- [x] Preserve durable/WAL persistence-before-ack paths and fail-stop behavior.
+- [x] Test no-quorum timeout and later commitment of that same entry.
+- [x] Test client-write recovery under snapshot-WAL using `SIGKILL`.
+- [x] Preserve comprehensive Phase 1–21 log/node/network tests.
+- [ ] Test on Fedora, inspect staged files, and commit with real date.
+
+### Phase 22 commands
+
+```sh
+make clean && make && make test
+./build/test_raft_client_write
+python3 tests/test_client_write_integration.py ./build/raft-engine
+python3 tests/test_client_write_durable.py ./build/raft-engine
+./build/raft-engine --write config/node1.conf 2 2500 'SET alpha hello'
+```
+
+### Phase 22 staging list (all new or changed files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_client_write.h include/raft_replicate_client.h include/raft_wire.h \
+  src/raft_client_write.c src/raft_replicate_client.c src/raft_tcp.c \
+  src/raft_wire.c src/main.c \
+  tests/test_raft_client_write.c tests/test_client_write_integration.py \
+  tests/test_client_write_durable.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: acknowledge client writes only after raft majority commit"
+```
+
+**Next:** Phase 23 — request IDs, deduplication and safer retry semantics.
