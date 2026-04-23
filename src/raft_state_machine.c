@@ -1,4 +1,5 @@
 #include "raft_state_machine.h"
+#include "raft_dedup.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -105,14 +106,45 @@ raft_status_t raft_apply_committed(raft_node_t *node, raft_kv_store_t *store,
                                    raft_index_t *out_applied)
 {
     if (node == NULL || store == NULL || out_applied == NULL ||
-        store->count > RAFT_KV_MAX_KEYS || !raft_node_is_valid(node))
+        store->count > RAFT_KV_MAX_KEYS ||
+        store->session_count > RAFT_KV_MAX_SESSIONS || !raft_node_is_valid(node))
         return RAFT_ERR_INVALID_ARGUMENT;
     raft_index_t completed = 0;
     while (node->last_applied < node->commit_index) {
         raft_index_t next = node->last_applied + 1u;
         const raft_log_entry_t *entry = raft_log_at(&node->log, next);
         if (entry == NULL) return RAFT_ERR_INVALID_ARGUMENT;
-        int action = execute(store, entry);
+        int action = 0;
+        raft_dedup_entry_t identity;
+        int wrapped = raft_dedup_parse(entry->command, entry->command_len, &identity);
+        if (wrapped == 1) {
+            size_t slot=0;
+            for (; slot<store->session_count; ++slot)
+                if (store->sessions[slot].client_id == identity.client_id) break;
+            /* Duplicate or out-of-order committed request: consume its index,
+             * never execute the command a second time. */
+            if (slot == store->session_count ||
+                identity.request_id > store->sessions[slot].request_id) {
+                if (slot < store->session_count ||
+                    store->session_count < RAFT_KV_MAX_SESSIONS) {
+                    raft_log_entry_t plain={entry->term,(uint8_t *)identity.command,
+                                            identity.command_len};
+                    action = execute(store, &plain);
+                    if (action > 0) {
+                        if (slot == store->session_count) ++store->session_count;
+                        raft_kv_session_t *rec=&store->sessions[slot];
+                        rec->client_id=identity.client_id;
+                        rec->request_id=identity.request_id;
+                        rec->index=next;
+                        rec->term=entry->term;
+                        rec->command_len=(uint16_t)identity.command_len;
+                        memcpy(rec->command,identity.command,identity.command_len);
+                    }
+                }
+            }
+        } else if (wrapped == 0) {
+            action = execute(store, entry);
+        }
         if (action < 0) {
             *out_applied = completed;
             return RAFT_ERR_NO_MEMORY;

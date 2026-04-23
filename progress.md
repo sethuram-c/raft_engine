@@ -746,3 +746,41 @@ git commit -m "feat: acknowledge client writes only after raft majority commit"
 ```
 
 **Next:** Phase 23 — request IDs, deduplication and safer retry semantics.
+
+## Phase 23 / 35 — Client Request IDs & Deduplication
+
+- [x] Define optional new wire types 23/24 and binary-safe request encoding.
+- [x] Wrap client ID/request ID together with the original replicated command.
+- [x] Maintain deterministic per-client last-applied session records.
+- [x] Reject stale IDs and conflicting command reuse; prevent multiple in-flight operations per client.
+- [x] Deduplicate pending requests without creating another log entry.
+- [x] Preserve session records through snapshot v2, InstallSnapshot, and snapshot-WAL restart.
+- [x] Keep snapshot v1 readable and legacy `--write` protocol compatible.
+- [x] Add Phase 23 C unit tests, real-cluster leader replacement, timeout/retry, compaction and SIGKILL integration tests.
+- [x] Preserve Phase 1–22 unit tests and run earlier network tests.
+- [ ] Run on Fedora, inspect changes, and commit using the actual local date.
+
+### Commands
+
+```sh
+make clean && make && make test
+./build/test_raft_dedup
+python3 tests/test_dedup_integration.py ./build/raft-engine
+./build/raft-engine --write-id config/node1.conf 2 2500 81001 1 'SET alpha beta'
+```
+
+### Git staging list — all Phase 23 new or changed files
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_dedup.h include/raft_replicate_client.h \
+  include/raft_state_machine.h include/raft_wire.h \
+  src/main.c src/raft_dedup.c src/raft_replicate_client.c \
+  src/raft_snapshot.c src/raft_state_machine.c src/raft_tcp.c src/raft_wire.c \
+  tests/test_raft_dedup.c tests/test_dedup_integration.py
+git diff --cached --check
+git status
+git commit -m "feat: deduplicate raft client writes using replicated request IDs"
+```
+
+**Next:** Phase 24 — automatic leader discovery / client retries with bounded redirects.

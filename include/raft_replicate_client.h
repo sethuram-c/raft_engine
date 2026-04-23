@@ -27,4 +27,9 @@ int raft_replicate_client_snapshot_compact(const raft_cluster_config_t *config,
 int raft_replicate_client_write(const raft_cluster_config_t *config,
                                 raft_node_id_t peer_id, uint32_t timeout_ms,
                                 const uint8_t *command, size_t length);
+/* Phase 23 retryable write: retain identical client/request/command across retries. */
+int raft_replicate_client_write_id(const raft_cluster_config_t *config,
+            raft_node_id_t peer_id,uint32_t timeout_ms,
+            uint64_t client_id,uint64_t request_id,
+            const uint8_t *command,size_t length);
 #endif

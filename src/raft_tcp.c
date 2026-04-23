@@ -13,6 +13,7 @@
 #include "raft_snapwal.h"
 #include "raft_install.h"
 #include "raft_client_write.h"
+#include "raft_dedup.h"
 #include <stdlib.h>
 
 #include <arpa/inet.h>
@@ -249,6 +250,78 @@ static int durable_checkpoint(tcp_server_t *server)
 }
 
 
+/* Caller holds server->mutex. The record in the applied state handles
+ * compacted history, and the suffix scan prevents duplicate uncommitted
+ * entries, including requests inherited from a previous leader. */
+static raft_client_write_status_t dedup_admit(tcp_server_t *server,
+                              const raft_dedup_entry_t *request,
+                              raft_term_t *term, raft_index_t *index)
+{
+    raft_node_t *node=&server->vote_node;
+    raft_kv_store_t *store=&server->kv;
+    for (size_t i=0; i<store->session_count; ++i) {
+        const raft_kv_session_t *rec=&store->sessions[i];
+        if (rec->client_id!=request->client_id) continue;
+        if (request->request_id<rec->request_id) return RAFT_CLIENT_WRITE_REJECTED;
+        if (request->request_id==rec->request_id) {
+            if (rec->command_len!=request->command_len ||
+                memcmp(rec->command,request->command,request->command_len))
+                return RAFT_CLIENT_WRITE_REJECTED;
+            *term=rec->term; *index=rec->index;
+            return RAFT_CLIENT_WRITE_COMMITTED;
+        }
+        break;
+    }
+    /* Include committed-but-not-applied entries: application may lag. */
+    for (raft_index_t n=node->last_applied+1;
+         n<=raft_log_last_index(&node->log); ++n) {
+        const raft_log_entry_t *entry=raft_log_at(&node->log,n);
+        if (!entry) return RAFT_CLIENT_WRITE_UNKNOWN;
+        raft_dedup_entry_t stored;
+        if (raft_dedup_parse(entry->command,entry->command_len,&stored)!=1 ||
+            stored.client_id!=request->client_id) continue;
+        if (stored.request_id!=request->request_id ||
+            stored.command_len!=request->command_len ||
+            memcmp(stored.command,request->command,request->command_len))
+            return RAFT_CLIENT_WRITE_REJECTED;
+        *term=entry->term; *index=n;
+        return n<=node->commit_index ? RAFT_CLIENT_WRITE_COMMITTED :
+                                       RAFT_CLIENT_WRITE_PENDING;
+    }
+    if (store->session_count==RAFT_KV_MAX_SESSIONS) {
+        bool known=false;
+        for (size_t i=0;i<store->session_count;++i)
+            if (store->sessions[i].client_id==request->client_id) known=true;
+        if (!known) return RAFT_CLIENT_WRITE_REJECTED;
+    }
+    uint8_t command[RAFT_DEDUP_PREFIX+RAFT_CLIENT_WRITE_MAX_COMMAND];
+    size_t command_len=0;
+    if (raft_dedup_wrap(request->client_id,request->request_id,
+                        request->command,request->command_len,
+                        command,sizeof(command),&command_len)!=0 ||
+        raft_log_append(&node->log,node->current_term,command,command_len)!=RAFT_OK)
+        return RAFT_CLIENT_WRITE_REJECTED;
+    *term=node->current_term; *index=raft_log_last_index(&node->log);
+    return durable_checkpoint(server)==0 ? RAFT_CLIENT_WRITE_PENDING :
+                                            RAFT_CLIENT_WRITE_UNKNOWN;
+}
+
+static raft_client_write_status_t dedup_poll(tcp_server_t *server,
+                                             raft_term_t term,raft_index_t index)
+{
+    const raft_node_t *node=&server->vote_node;
+    if (server->storage_failed || node->role!=RAFT_LEADER)
+        return RAFT_CLIENT_WRITE_UNKNOWN;
+    if (index<=node->log.base_index)
+        return node->commit_index>=index ? RAFT_CLIENT_WRITE_COMMITTED :
+                                          RAFT_CLIENT_WRITE_UNKNOWN;
+    raft_term_t actual_term=0;
+    if (raft_log_term_at(&node->log,index,&actual_term)!=RAFT_OK ||
+        actual_term!=term) return RAFT_CLIENT_WRITE_UNKNOWN;
+    return node->commit_index>=index ? RAFT_CLIENT_WRITE_COMMITTED :
+                                       RAFT_CLIENT_WRITE_PENDING;
+}
+
 static void process_client(int fd, tcp_server_t *server)
 {
     uint8_t payload[RAFT_WIRE_MAX_PAYLOAD];
@@ -442,6 +515,53 @@ static void process_client(int fd, tcp_server_t *server)
         response[16]=(uint8_t)accepted;
         (void)raft_wire_send(fd,RAFT_WIRE_SNAPSHOT_COMPACT_RESPONSE,response,
                              sizeof(response),message,sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_CLIENT_WRITE_ID) {
+        raft_dedup_entry_t request;
+        raft_client_write_response_t reply={0,0,RAFT_CLIENT_WRITE_REJECTED};
+        uint32_t timeout_ms=0;
+        uint64_t start_ms=0;
+        int valid=raft_dedup_decode_request(payload,length,&timeout_ms,&request)==0 &&
+                  raft_clock_monotonic_ms(&start_ms)==RAFT_OK;
+        if (valid) {
+            (void)pthread_mutex_lock(&server->mutex);
+            raft_node_t *node=&server->vote_node;
+            reply.term=node->current_term;
+            if (server->storage_failed) reply.status=RAFT_CLIENT_WRITE_UNKNOWN;
+            else if (node->role!=RAFT_LEADER || !node->current_term)
+                reply.status=RAFT_CLIENT_WRITE_NOT_LEADER;
+            else if (stop_requested || atomic_load(&server->election_stop))
+                reply.status=RAFT_CLIENT_WRITE_UNKNOWN;
+            else {
+                /* Apply any committed entries before looking up a request ID. */
+                raft_index_t applied=0;
+                if (raft_apply_committed(node,&server->kv,&applied)!=RAFT_OK)
+                    reply.status=RAFT_CLIENT_WRITE_UNKNOWN;
+                else reply.status=dedup_admit(server,&request,&reply.term,&reply.index);
+            }
+            (void)pthread_mutex_unlock(&server->mutex);
+            while (reply.status==RAFT_CLIENT_WRITE_PENDING) {
+                uint64_t now_ms=0;
+                if (raft_clock_monotonic_ms(&now_ms)!=RAFT_OK) {
+                    reply.status=RAFT_CLIENT_WRITE_UNKNOWN; break;
+                }
+                (void)pthread_mutex_lock(&server->mutex);
+                reply.status=dedup_poll(server,reply.term,reply.index);
+                (void)pthread_mutex_unlock(&server->mutex);
+                if (reply.status!=RAFT_CLIENT_WRITE_PENDING) break;
+                if (stop_requested || atomic_load(&server->election_stop)) {
+                    reply.status=RAFT_CLIENT_WRITE_UNKNOWN; break;
+                }
+                if (now_ms-start_ms>=timeout_ms) {
+                    reply.status=RAFT_CLIENT_WRITE_TIMEOUT; break;
+                }
+                struct timespec pause={.tv_sec=0,.tv_nsec=20000000L};
+                (void)nanosleep(&pause,NULL);
+            }
+        }
+        uint8_t out[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
+        if (raft_client_write_encode_response(&reply,out)==0)
+            (void)raft_wire_send(fd,RAFT_WIRE_CLIENT_WRITE_ID_RESPONSE,
+                                 out,sizeof(out),message,sizeof(message));
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_CLIENT_WRITE) {
         /* Bounded synchronous write: a reply says COMMITTED only once a
          * majority-backed index in this leader term is committed. Neither

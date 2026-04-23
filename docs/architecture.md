@@ -1,3 +1,49 @@
+## Phase 23 — Replicated client identities and retryable writes
+
+The new `--write-id` RPC is separate from the Phase 22 write message, keeping
+old clients and wire fixtures unchanged. Its payload is a four-byte big-endian
+timeout followed by a big-endian `client_id:u64`, `request_id:u64`, and
+1–1024 bytes of valid `SET` / `DEL` commands. The new framed TCP types are
+23 (request) and 24 (response). The response uses the existing 17-byte
+`(term:u64,index:u64,status:u8)` codec. A `REJECTED` response includes
+conflicting ID reuse, stale sequence, or a second outstanding request.
+
+Each new log command is wrapped as `RID1 | client_id:u64 | request_id:u64 |
+original binary command`. While holding the server mutex, the leader checks
+(1) the **applied session table** for committed operations, and (2) the
+**unapplied log suffix** for inherited or currently pending operations.
+Equality requires byte-for-byte command equality, not just a weak hash. A
+committed duplicate is answered using its original log term and index. An
+uncommitted duplicate is awaited; no new entry is appended. Different IDs
+from the same client cannot overtake an unresolved earlier request.
+
+The ordered KV application path consumes each committed Raft index exactly
+once. For `RID1` entries it executes only if the request number increases;
+replayed/stale/duplicate entries consume their index as deterministic no-ops.
+Each session stores the latest client ID, request ID, original term/index,
+command length, and exact command bytes. This table is replicated application
+state and **must** travel with snapshots.
+
+State-machine snapshots keep exact version-1 bytes when the session table is
+empty. Version 2 appends a BE `session_count:u16` and per-client entries
+`client:u64, request:u64, index:u64, term:u64, length:u16, raw_command` before
+the trailing CRC32. Decode validates lengths and unique client IDs before
+installing state. This allows snapshot-aware WAL recovery to preserve
+retry safety after Raft log-prefix compaction and a process restart.
+
+**Boundaries:** One unresolved request per client; strictly increasing
+request IDs; 32 distinct clients maximum; no automatic pruning/eviction; no
+cryptographic client identity or protocol authentication; legacy `--write`
+is intentionally not deduplicated. A rejected request is not the same as an
+indeterminate one. Retry with the same identity and same command until the
+request is known committed or the client investigates an explicit rejection.
+
+**Safety details:** Commit still requires a majority. A timeout never undoes
+an entry. IDs are replicated in the Raft log, not a volatile per-leader map.
+The session table becomes visible only on deterministic ordered application.
+Leader checks pending log entries even when application is behind. Snapshot
+v2 round-trips exact commands rather than a collision-prone digest.
+
 # Raft Engine Architecture - Through Phase 14
 
 The early sections are preserved as **historical phase snapshots**. For the

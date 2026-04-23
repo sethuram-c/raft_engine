@@ -4,6 +4,7 @@
 #include "raft_wire.h"
 #include "raft_state_machine.h"
 #include "raft_client_write.h"
+#include "raft_dedup.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -277,6 +278,60 @@ int raft_replicate_client_write(const raft_cluster_config_t *config,
         reply.status == RAFT_CLIENT_WRITE_UNKNOWN)
         puts("INDETERMINATE: the write may commit later. No automatic retry or deduplication.");
     switch (reply.status) {
+    case RAFT_CLIENT_WRITE_COMMITTED: return 0;
+    case RAFT_CLIENT_WRITE_NOT_LEADER: return 2;
+    case RAFT_CLIENT_WRITE_TIMEOUT:
+    case RAFT_CLIENT_WRITE_UNKNOWN: return 3;
+    case RAFT_CLIENT_WRITE_REJECTED: return 4;
+    default: return 1;
+    }
+}
+
+int raft_replicate_client_write_id(const raft_cluster_config_t *config,
+            raft_node_id_t peer_id,uint32_t timeout_ms,
+            uint64_t client_id,uint64_t request_id,
+            const uint8_t *command,size_t length)
+{
+    if (!config) return 1;
+    uint8_t bytes[RAFT_DEDUP_WIRE_PREFIX+RAFT_CLIENT_WRITE_MAX_COMMAND];
+    size_t n=0;
+    if (raft_dedup_encode_request(timeout_ms,client_id,request_id,
+                                  command,length,bytes,sizeof(bytes),&n)!=0) {
+        fputs("Invalid retryable write parameters\n",stderr);
+        return 4;
+    }
+    char error[256];
+    int fd=connect_peer(config,peer_id,error);
+    if (fd<0) { fprintf(stderr,"Connect failed: %s\n",error); return 1; }
+    struct timeval wait={.tv_sec=5,.tv_usec=0};
+    if (setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&wait,sizeof(wait))!=0) {
+        (void)close(fd); return 1;
+    }
+    raft_wire_status_t result=raft_wire_send(fd,RAFT_WIRE_CLIENT_WRITE_ID,
+                                              bytes,n,error,sizeof(error));
+    raft_wire_type_t type=0;
+    uint8_t reply_bytes[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
+    size_t reply_len=0;
+    if (result==RAFT_WIRE_OK)
+        result=raft_wire_recv(fd,&type,reply_bytes,sizeof(reply_bytes),
+                              &reply_len,error,sizeof(error));
+    (void)close(fd);
+    raft_client_write_response_t reply;
+    if (result!=RAFT_WIRE_OK || type!=RAFT_WIRE_CLIENT_WRITE_ID_RESPONSE ||
+        raft_client_write_decode_response(reply_bytes,reply_len,&reply)!=0) {
+        fprintf(stderr,"Request outcome unknown: %s\n",error);
+        return 3;
+    }
+    printf("Retryable write: peer=%u client=%llu request=%llu status=%s term=%llu index=%llu\n",
+           peer_id,(unsigned long long)client_id,(unsigned long long)request_id,
+           raft_client_write_status_name(reply.status),
+           (unsigned long long)reply.term,(unsigned long long)reply.index);
+    if (reply.status==RAFT_CLIENT_WRITE_TIMEOUT ||
+        reply.status==RAFT_CLIENT_WRITE_UNKNOWN)
+        puts("INDETERMINATE: retry with exactly the same client ID, request ID, and command.");
+    if (reply.status==RAFT_CLIENT_WRITE_REJECTED)
+        puts("REJECTED: ID conflict, stale ID, overlapping request, or capacity/command error.");
+    switch(reply.status) {
     case RAFT_CLIENT_WRITE_COMMITTED: return 0;
     case RAFT_CLIENT_WRITE_NOT_LEADER: return 2;
     case RAFT_CLIENT_WRITE_TIMEOUT:

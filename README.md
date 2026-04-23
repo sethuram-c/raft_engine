@@ -2,9 +2,65 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 22 / 35 — Client Write Requests and Majority-Commit Acknowledgements.**
+**Current milestone: Phase 23 / 35 — Client Request IDs, Deduplication, and Safe Retries.**
 
-Phase 22 adds a bounded, leader-targeted **`--write` client operation** that returns
+Phase 23 extends Phase 22 with an **opt-in `--write-id` API**. The client
+supplies nonzero 64-bit `(client_id, request_id)` values. The replicated log
+contains the identity and exact command. Every node applies a given client
+request at most once, and the applied-session table survives state-machine
+snapshot compaction, snapshot installation, and snapshot-WAL crash recovery.
+
+### Phase 23 quickstart
+
+```sh
+make clean && make && make test
+./build/test_raft_dedup
+python3 tests/test_dedup_integration.py ./build/raft-engine
+
+# Start three nodes in three terminals (durable example uses a fresh folder):
+./build/raft-engine --elect-snapshot-wal config/node1.conf data23
+./build/raft-engine --elect-snapshot-wal config/node2.conf data23
+./build/raft-engine --elect-snapshot-wal config/node3.conf data23
+
+# Discover leader ID with --status; here assume node 2 is elected.
+./build/raft-engine --write-id config/node1.conf 2 2500 81001 1 'SET order_1 placed'
+
+# Repeat exactly the same IDs and command after an ambiguous timeout:
+./build/raft-engine --write-id config/node1.conf 2 2500 81001 1 'SET order_1 placed'
+# Move to request 2 ONLY after request 1 is committed or resolved:
+./build/raft-engine --write-id config/node1.conf 2 2500 81001 2 'DEL order_1'
+```
+
+`--write-id CONFIG PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND` uses
+strictly increasing request numbers per client and **one outstanding request
+per client**. Reuse the same ID and the **identical raw command** on every
+retry. Equal committed requests return the original `(term, index)` without
+new admission. Conflicting reuse, stale numbers, or a different request while
+one is pending return `REJECTED`. Timeouts and network errors remain
+indeterminate; retrying the same identity is safe (do not silently switch
+identities). Other-client progress is unaffected by an outstanding request.
+
+**Scope and limits:** Deduplication covers only `--write-id` (not the legacy
+`--write` or diagnostic proposal RPC). Up to **32 distinct client IDs** can be
+tracked per state machine; records are never silently evicted. IDs are not
+authenticated; this is a trusted laboratory API with no client-side ID
+allocator or automatic redirection. A `COMMITTED` result confirms Raft
+commitment, not guaranteed successful key insertion (table-full commands
+remain deterministic no-ops). Client IDs and request numbers must be
+persisted by the *client* across restarts. Snapshot version 2 is used when
+session records exist; legacy version 1 snapshots remain decodable.
+
+### Phase 23 test commands
+
+```sh
+make clean && make && make test
+./build/test_raft_dedup
+python3 tests/test_dedup_integration.py ./build/raft-engine
+```
+
+---
+
+**Previously (Phase 22):** Phase 22 adds a bounded, leader-targeted **`--write` client operation** that returns
 `COMMITTED` only after the leader's majority-backed `commitIndex` reaches the
 new entry in the same leadership term. It accepts valid `SET` / `DEL`
 commands, rejects follower writes and malformed commands, and distinguishes

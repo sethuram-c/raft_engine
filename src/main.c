@@ -514,6 +514,25 @@ static int propose_demo_peer(const char *path, const char *peer_text,
               (const uint8_t *)command, len) == 0 ? 0 : 1;
 }
 
+static int client_write_id_peer(const char *path, const char *peer_text,
+                                const char *timeout_text,const char *client_text,
+                                const char *request_text,const char *command)
+{
+    raft_cluster_config_t config;
+    if (load_config(path,&config)!=0) return 1;
+    uint64_t peer=0,timeout=0,client_id=0,request_id=0;
+    if (parse_decimal_u64(peer_text,&peer)!=0 || peer==0 || peer>UINT32_MAX ||
+        parse_decimal_u64(timeout_text,&timeout)!=0 || timeout<100 || timeout>3000 ||
+        parse_decimal_u64(client_text,&client_id)!=0 || !client_id ||
+        parse_decimal_u64(request_text,&request_id)!=0 || !request_id) {
+        fputs("Write-id expects peer, timeout 100..3000, nonzero client and request IDs\n",stderr);
+        return 1;
+    }
+    return raft_replicate_client_write_id(&config,(raft_node_id_t)peer,
+                 (uint32_t)timeout,client_id,request_id,
+                 (const uint8_t *)command,strlen(command));
+}
+
 static int client_write_peer(const char *path, const char *peer_text,
                              const char *timeout_text, const char *command)
 {
@@ -614,7 +633,7 @@ static void usage(void)
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
           "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
-          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND]\n", stderr);
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -687,6 +706,8 @@ int main(int argc, char **argv)
         return apply_status_peer(argv[2], argv[3]);
     if (argc == 5 && strcmp(argv[1], "--get-demo") == 0)
         return get_demo_peer(argv[2], argv[3], argv[4]);
+    if (argc == 8 && strcmp(argv[1], "--write-id") == 0)
+        return client_write_id_peer(argv[2],argv[3],argv[4],argv[5],argv[6],argv[7]);
     if (argc == 6 && strcmp(argv[1], "--write") == 0)
         return client_write_peer(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 5 && strcmp(argv[1], "--propose-demo") == 0)

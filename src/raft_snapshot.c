@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "raft_snapshot.h"
+#include "raft_client_write.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -82,6 +83,7 @@ static int state_valid(const raft_snapshot_t *s)
 {
     if (!s || !s->last_index || !s->last_term ||
         s->state.count > RAFT_KV_MAX_KEYS ||
+        s->state.session_count > RAFT_KV_MAX_SESSIONS ||
         s->state.executed_commands > s->last_index ||
         s->state.ignored_commands != s->last_index - s->state.executed_commands)
         return 0;
@@ -95,6 +97,15 @@ static int state_valid(const raft_snapshot_t *s)
         for (size_t j = 0; j < i; ++j)
             if (strcmp(item->key, s->state.items[j].key) == 0) return 0;
     }
+    for (size_t i=0; i<s->state.session_count; ++i) {
+        const raft_kv_session_t *rec=&s->state.sessions[i];
+        if (!rec->client_id || !rec->request_id || !rec->term ||
+            !rec->index || rec->index>s->last_index || rec->term>s->last_term ||
+            !raft_client_write_valid_command(rec->command,rec->command_len))
+            return 0;
+        for (size_t j=0; j<i; ++j)
+            if (s->state.sessions[j].client_id==rec->client_id) return 0;
+    }
     return 1;
 }
 
@@ -104,6 +115,9 @@ static raft_status_t deep_copy(const raft_snapshot_t *s, raft_snapshot_t *out)
     raft_snapshot_init(&tmp);
     tmp.last_index = s->last_index;
     tmp.last_term = s->last_term;
+    tmp.state.session_count = s->state.session_count;
+    memcpy(tmp.state.sessions,s->state.sessions,
+           s->state.session_count*sizeof(s->state.sessions[0]));
     tmp.state.executed_commands = s->state.executed_commands;
     tmp.state.ignored_commands = s->state.ignored_commands;
     for (size_t i = 0; i < s->state.count; ++i) {
@@ -156,10 +170,19 @@ raft_status_t raft_snapshot_encode(const raft_snapshot_t *s,
             return RAFT_ERR_OUT_OF_RANGE;
         size += 4u + k + it->value_len;
     }
+    /* Version 1 remains byte-identical for existing snapshots. Version 2
+     * appends an explicit count and fixed-size client dedup records. */
+    if (s->state.session_count) {
+        size_t extra=2u;
+        for (size_t i=0;i<s->state.session_count;++i)
+            extra += 34u + s->state.sessions[i].command_len;
+        if (size > RAFT_SNAPSHOT_MAX_BYTES-extra) return RAFT_ERR_OUT_OF_RANGE;
+        size += extra;
+    }
     uint8_t *data = malloc(size);
     if (!data) return RAFT_ERR_NO_MEMORY;
     memcpy(data, snap_magic, 8);
-    put32(data + 8, 1); /* version */
+    put32(data + 8, s->state.session_count ? 2u : 1u);
     put64(data + 12, s->last_index);
     put64(data + 20, s->last_term);
     put64(data + 28, s->state.executed_commands);
@@ -176,6 +199,18 @@ raft_status_t raft_snapshot_encode(const raft_snapshot_t *s,
         if (it->value_len) memcpy(data + at, it->value, it->value_len);
         at += it->value_len;
     }
+    if (s->state.session_count) {
+        put16(data+at,(uint16_t)s->state.session_count); at+=2;
+        for (size_t i=0; i<s->state.session_count; ++i) {
+            const raft_kv_session_t *r=&s->state.sessions[i];
+            put64(data+at,r->client_id); at+=8;
+            put64(data+at,r->request_id); at+=8;
+            put64(data+at,r->index); at+=8;
+            put64(data+at,r->term); at+=8;
+            put16(data+at,r->command_len); at+=2;
+            memcpy(data+at,r->command,r->command_len); at+=r->command_len;
+        }
+    }
     put32(data + at, checksum(data, at));
     *out_bytes = data; *out_length = size;
     return RAFT_OK;
@@ -186,7 +221,8 @@ raft_status_t raft_snapshot_decode(const uint8_t *data, size_t length,
 {
     if (!data || !out || length < SNAP_HEADER + 4 ||
         length > RAFT_SNAPSHOT_MAX_BYTES ||
-        memcmp(data, snap_magic, 8) != 0 || get32(data + 8) != 1 ||
+        memcmp(data, snap_magic, 8) != 0 ||
+        (get32(data + 8) != 1 && get32(data + 8) != 2) ||
         get32(data + length - 4) != checksum(data, length - 4))
         return RAFT_ERR_INVALID_ARGUMENT;
     raft_snapshot_t tmp;
@@ -216,6 +252,25 @@ raft_status_t raft_snapshot_decode(const uint8_t *data, size_t length,
         it->value_len = v;
         ++tmp.state.count;
         at += v;
+    }
+    if (get32(data+8)==2) {
+        if (at>length-4 || length-4-at<2) goto bad;
+        size_t count_sessions=get16(data+at); at+=2;
+        if (count_sessions==0 || count_sessions>RAFT_KV_MAX_SESSIONS ||
+            count_sessions>(length-4-at)/34u) goto bad;
+        for (size_t i=0; i<count_sessions; ++i) {
+            if (at > length-4 || length-4-at < 34u) goto bad;
+            raft_kv_session_t *r=&tmp.state.sessions[i];
+            r->client_id=get64(data+at); at+=8;
+            r->request_id=get64(data+at); at+=8;
+            r->index=get64(data+at); at+=8;
+            r->term=get64(data+at); at+=8;
+            r->command_len=get16(data+at); at+=2;
+            if (r->command_len > RAFT_KV_MAX_VALUE_BYTES ||
+                r->command_len > length-4-at) goto bad;
+            memcpy(r->command,data+at,r->command_len); at+=r->command_len;
+        }
+        tmp.state.session_count=count_sessions;
     }
     if (at != length - 4 || !state_valid(&tmp)) goto bad;
     raft_snapshot_destroy(out);

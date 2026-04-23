@@ -15,6 +15,7 @@
  * Client reads below are local diagnostics, NOT linearizable Raft reads.
  * Every function is externally synchronized with its raft_node_t. */
 #define RAFT_KV_MAX_KEYS 128u
+#define RAFT_KV_MAX_SESSIONS 32u
 #define RAFT_KV_MAX_KEY_BYTES 64u
 #define RAFT_KV_MAX_VALUE_BYTES 1024u
 
@@ -24,7 +25,20 @@ typedef struct {
     size_t value_len;
 } raft_kv_item_t;
 
+/* Last committed request of each client; replicated deterministic state.
+ * Requests are sequential per client. Never evict a record silently. */
 typedef struct {
+    uint64_t client_id;
+    uint64_t request_id;
+    raft_index_t index;
+    raft_term_t term;
+    uint16_t command_len;
+    uint8_t command[RAFT_KV_MAX_VALUE_BYTES];
+} raft_kv_session_t;
+
+typedef struct {
+    raft_kv_session_t sessions[RAFT_KV_MAX_SESSIONS];
+    size_t session_count;
     raft_kv_item_t items[RAFT_KV_MAX_KEYS];
     size_t count;
     raft_index_t executed_commands;
