@@ -784,3 +784,39 @@ git commit -m "feat: deduplicate raft client writes using replicated request IDs
 ```
 
 **Next:** Phase 24 — automatic leader discovery / client retries with bounded redirects.
+
+## Phase 24 / 35 — Automatic Leader Discovery & Bounded Client Retries
+
+- [x] Add a separate client-side router without changing existing RPC types.
+- [x] Probe configured peers for role and term; reject malformed or mismatched status frames.
+- [x] Choose a single leader at the highest observed term; handle split and stale responses.
+- [x] Add `--write-auto CONFIG BUDGET_MS CLIENT_ID REQUEST_ID COMMAND`.
+- [x] Reuse the same encoded identity/payload throughout all retries.
+- [x] Retry `NOT_LEADER`, `TIMEOUT`, `UNKNOWN`, and transport failures within a monotonic deadline.
+- [x] Return `COMMITTED` only on a server commit acknowledgement; stop on `REJECTED`.
+- [x] Preserve legacy CLI and wire compatibility and comprehensive legacy log/node tests.
+- [x] Add deterministic router unit assertions and three-node recovery/failover tests.
+- [ ] Run on Fedora, review stage, and commit using actual completion time.
+
+### Phase 24 commands
+
+```sh
+make clean && make && make test
+./build/test_raft_client_auto
+python3 tests/test_auto_client_integration.py ./build/raft-engine
+./build/raft-engine --write-auto config/node1.conf 8000 91001 1 'SET order paid'
+```
+
+### Phase 24 Git changes (all nine new/modified files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_client_auto.h src/raft_client_auto.c src/main.c \
+  tests/test_raft_client_auto.c tests/test_auto_client_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: discover raft leaders and safely retry client writes"
+```
+
+**Next:** Phase 25 — authenticated client requests and stricter admission controls.

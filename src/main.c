@@ -4,6 +4,7 @@
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
+#include "raft_client_auto.h"
 #include "raft_wal.h"
 #include "raft_snapshot.h"
 
@@ -533,6 +534,25 @@ static int client_write_id_peer(const char *path, const char *peer_text,
                  (const uint8_t *)command,strlen(command));
 }
 
+/* Phase 24: topology-only config; no peer ID required. */
+static int client_write_auto(const char *path,const char *budget_text,
+                             const char *client_text,const char *request_text,
+                             const char *command)
+{
+    raft_cluster_config_t config;
+    if (load_config(path,&config)!=0) return 1;
+    uint64_t budget=0,client=0,request=0;
+    if (parse_decimal_u64(budget_text,&budget)!=0 ||
+        budget<RAFT_AUTO_MIN_BUDGET_MS || budget>RAFT_AUTO_MAX_BUDGET_MS ||
+        parse_decimal_u64(client_text,&client)!=0 || client==0 ||
+        parse_decimal_u64(request_text,&request)!=0 || request==0) {
+        fputs("Usage: --write-auto CONFIG BUDGET_MS(500..30000) CLIENT_ID REQUEST_ID COMMAND\n",stderr);
+        return 1;
+    }
+    return raft_client_auto_write(&config,(uint32_t)budget,client,request,
+                                 (const uint8_t *)command,strlen(command));
+}
+
 static int client_write_peer(const char *path, const char *peer_text,
                              const char *timeout_text, const char *command)
 {
@@ -633,7 +653,7 @@ static void usage(void)
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
           "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
-          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND]\n", stderr);
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -706,6 +726,8 @@ int main(int argc, char **argv)
         return apply_status_peer(argv[2], argv[3]);
     if (argc == 5 && strcmp(argv[1], "--get-demo") == 0)
         return get_demo_peer(argv[2], argv[3], argv[4]);
+    if (argc == 7 && strcmp(argv[1], "--write-auto") == 0)
+        return client_write_auto(argv[2],argv[3],argv[4],argv[5],argv[6]);
     if (argc == 8 && strcmp(argv[1], "--write-id") == 0)
         return client_write_id_peer(argv[2],argv[3],argv[4],argv[5],argv[6],argv[7]);
     if (argc == 6 && strcmp(argv[1], "--write") == 0)

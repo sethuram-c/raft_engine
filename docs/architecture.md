@@ -1,3 +1,39 @@
+## Phase 24 — Topology-aware client routing without new Raft messages
+
+The new `src/raft_client_auto.c` is a **client-only** layer built on the
+Phase 9 STATUS RPC and Phase 23 `CLIENT_WRITE_ID` RPC. There is no wire
+version or server modification. An external client may connect even to a
+peer whose ID matches the configuration's node ID.
+
+1. Validate the three-node configuration, request ID, and command.
+2. Encode the Phase 23 request **once** with an internal 450 ms per-attempt
+   server wait (the overall client budget is specified separately).
+3. Poll all configured peers with a bounded TCP STATUS request. Only accept
+   exact 17-byte frames whose ID matches the contacted peer.
+4. Choose exactly one advertised leader at the greatest observed term. If a
+   higher-term follower/candidate exists, do not route to a stale leader.
+5. Send the unchanged encoded request to that leader. `COMMITTED` ends
+   successfully; `REJECTED` is terminal; `NOT_LEADER`, `TIMEOUT`, `UNKNOWN`,
+   and transport errors cause a new discovery round.
+6. Enforce the overall deadline using `CLOCK_MONOTONIC`; on expiry report
+   `UNKNOWN` and remind the client to reuse its request identity.
+
+The client may see stale STATUS information, or a leader may step down after
+status polling. The server independently verifies Raft leadership before
+admitting a write. This architecture provides at-most-once *application* for
+the tracked Phase 23 identities under the documented session-table constraints.
+It is not a lease, a quorum read, or a linearizable GET. No client IDs are
+generated automatically; external callers must keep them stable.
+
+The unit tests cover malformed status frames, conflicting same-term leaders,
+higher-term candidates, missing peers, and reply decisions. The integration
+test exercises a real 3-process election, duplicate success, conflicting
+reuse, timeout when quorum is lost, same-ID resolution after recovery, and
+leader replacement (after a current-term barrier entry permits advancing
+an older-term commit index).
+
+---
+
 ## Phase 23 — Replicated client identities and retryable writes
 
 The new `--write-id` RPC is separate from the Phase 22 write message, keeping

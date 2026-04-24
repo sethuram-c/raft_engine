@@ -2,7 +2,67 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 23 / 35 — Client Request IDs, Deduplication, and Safe Retries.**
+**Current milestone: Phase 24 / 35 — Automatic Leader Discovery & Safe Client Retries.**
+
+Phase 24 adds a topology-aware, opt-in `--write-auto` CLI. It discovers
+leaders using the **existing 17-byte STATUS RPC**, selects a unique leader
+at the highest observed term, and sends the Phase 23 request-ID write RPC.
+It automatically retries **exactly the same encoded request** on leader
+changes, transient errors, and uncertain timeouts, bounded by an overall
+monotonic-clock deadline. STATUS is only a hint: every write is validated
+again by the contacted server. The configuration's `node_id` identifies the
+config file, not the client, and may point at any of the three running nodes.
+
+### Phase 24 quickstart
+
+```sh
+make clean && make && make test
+./build/test_raft_client_auto
+python3 tests/test_auto_client_integration.py ./build/raft-engine
+
+# Start the three nodes in separate terminals using --elect or
+# --elect-snapshot-wal CONFIG FRESH_DATA_DIRECTORY.
+./build/raft-engine --write-auto config/node1.conf 8000 91001 1 'SET order paid'
+# Reuse exactly the SAME identity and command if the entire CLI times out.
+./build/raft-engine --write-auto config/node1.conf 8000 91001 1 'SET order paid'
+# Only advance the request ID after the result is resolved.
+./build/raft-engine --write-auto config/node1.conf 8000 91001 2 'DEL order'
+```
+
+`--write-auto CONFIG OVERALL_TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND` uses an
+overall deadline of **500–30,000 ms**. It does not require a leader ID. Output
+includes discovery, final status, attempted writes and discovery rounds.
+Exit codes are `0=COMMITTED`, `3=UNKNOWN/indeterminate`, `4=REJECTED`,
+`1=invalid arguments/runtime error`. Node unavailability is retried until the
+budget expires. An uncertain result must be retried only with identical IDs
+and bytes, including across separate CLI invocations. The server still
+restricts clients to one outstanding request per client ID and at most 32
+active client IDs; it does not authenticate them.
+
+**Boundaries:** This is a best-effort bounded client loop, not a lease or
+proof of unique global leadership. Each TCP operation has a shorter timeout
+than the overall budget. The status protocol and legacy `--write`, `--write-id`
+behaviors remain unchanged. There is no authenticated client identity,
+linearizable read, automatic disk persistence of client counters, or promise
+that `COMMITTED` means the state-machine operation succeeded. No additional
+wire protocol types are needed for Phase 24.
+
+### Phase 24 Git staging list
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_client_auto.h src/raft_client_auto.c src/main.c \
+  tests/test_raft_client_auto.c tests/test_auto_client_integration.py
+git diff --cached --check
+git status
+git commit -m "feat: discover raft leaders and safely retry client writes"
+```
+
+---
+
+**Previous milestone: Phase 23**
+
+
 
 Phase 23 extends Phase 22 with an **opt-in `--write-id` API**. The client
 supplies nonzero 64-bit `(client_id, request_id)` values. The replicated log
