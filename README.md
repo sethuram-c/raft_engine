@@ -997,3 +997,81 @@ state. Phase 19 is a thoroughly tested *offline format and indexing milestone*,
 not production-ready space reclamation. Do not run this demo against a live
 node's data directory. Full log/WAL replacement and lagging-follower snapshot
 installation remain future work. See `docs/architecture.md`.
+
+## Phase 25: per-client authenticated write admission (opt-in)
+
+Phase 25 adds HMAC-SHA-256 signed retryable client writes without modifying
+Raft's replication algorithm. Unlike `--write-auto`, the new command proves
+possession of a **client-specific 32-byte secret**. The server looks up keys by
+client ID in an owner-only keyring and verifies the MAC *before* checking
+leadership, consulting deduplication records, or appending an entry. It rejects
+legacy write/diagnostic mutation RPCs while running in authenticated mode.
+
+The MAC signs `"RAFT25-CLIENT-WRITE-V1" || (timeout:u32 BE || client:u64 BE ||
+request:u64 BE || SET/DEL bytes)`. On wire, it uses the existing Phase 23
+request followed by a 32-byte HMAC-SHA-256 tag (frame types 25/26). The
+response is the usual 17-byte Phase 22 status record. HMAC verification uses
+OpenSSL and a constant-time MAC comparison. A credential is never transmitted,
+printed in stdout, or passed as a command-line value.
+
+Install prerequisites on Fedora: `sudo dnf install gcc make openssl-devel
+openssl python3`. To configure local development credentials:
+
+```sh
+umask 077
+mkdir -p /tmp/raft25-keys
+openssl rand -hex 32 > /tmp/raft25-keys/client-71001.hex
+# Provision the same client secret in the server keyring. A real deployment
+# distributes the server keyring separately and NEVER ships it to clients.
+printf '71001 %s\n' "$(cat /tmp/raft25-keys/client-71001.hex)" > /tmp/raft25-keys/server.keys
+chmod 600 /tmp/raft25-keys/client-71001.hex /tmp/raft25-keys/server.keys
+```
+
+Run all three nodes with the same keyring (three terminals):
+
+```sh
+./build/raft-engine --elect-auth config/node1.conf /tmp/raft25-keys/server.keys
+./build/raft-engine --elect-auth config/node2.conf /tmp/raft25-keys/server.keys
+./build/raft-engine --elect-auth config/node3.conf /tmp/raft25-keys/server.keys
+```
+
+Or use **coordinated snapshot-WAL persistence** in an isolated directory:
+
+```sh
+./build/raft-engine --elect-auth-wal config/node1.conf data-auth /tmp/raft25-keys/server.keys
+# Use matching node2.conf/node3.conf in the other terminals.
+```
+
+Clients need **only their own private secret file**:
+
+```sh
+./build/raft-engine --write-auth-auto config/node1.conf 8000 71001 1 \
+  /tmp/raft25-keys/client-71001.hex 'SET user authenticated'
+# Repeat the identical client ID, request ID and command after UNKNOWN.
+```
+
+`--write-id`, `--write`, `--write-auto`, `--propose-demo`, and
+`--snapshot-compact-demo` are not accepted by a server in authenticated mode.
+Existing non-authenticated modes deliberately remain compatible with their
+previous, insecure behavior; **do not mix secured and unsecured nodes**.
+All credential files must be regular files owned by the effective user, mode
+0600 or stricter, and must not be symlinks. Keyring format: one
+`CLIENT_ID 64_HEX_DIGITS` line per client, maximum 32 unique IDs.
+Client secret format: one `64_HEX_DIGITS` line. No sample real key is included.
+
+**Security boundary:** This is **not cluster security**. Raft peer RPCs,
+status/read responses and the original transport are NOT authenticated or
+encrypted; on a hostile network a peer-ID-spoofing attacker can still damage
+consensus state. A client MAC can be replayed (replicated request IDs prevent
+reapplying a recorded operation), and responses are not cryptographically
+protected. Use loopback or a trusted isolated network for this educational
+implementation. Future milestones should add mutual TLS for peer and client
+channels, authenticated responses, secret rotation and rate limiting.
+
+Run the new tests:
+
+```sh
+make clean && make && make test
+./build/test_raft_auth
+python3 tests/test_auth_integration.py ./build/raft-engine
+```

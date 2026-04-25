@@ -820,3 +820,42 @@ git commit -m "feat: discover raft leaders and safely retry client writes"
 ```
 
 **Next:** Phase 25 — authenticated client requests and stricter admission controls.
+
+## Phase 25 / 35 — Client Identity Authentication and Write Admission
+
+- [x] Add per-client HMAC-SHA-256 request authentication (OpenSSL, not custom crypto).
+- [x] Bind signed timeout, claimed client ID, request ID and command to one MAC.
+- [x] Load owner-only non-symlink credentials; reject unknown and duplicate IDs.
+- [x] Add opt-in `--elect-auth` and `--elect-auth-wal` secure client-write modes.
+- [x] Disable legacy unauthenticated write and diagnostic mutation RPCs in those modes.
+- [x] Add `--write-auth-auto` with automatic discovery and same-ID bounded retries.
+- [x] Reuse Phase 23 replicated dedup/session state and Phase 21 durable recovery.
+- [x] Add unit and three-node tests for credentials, forgery, replay, and SIGKILL restart.
+- [x] Preserve all Phase 1–24 unit tests and run the previous network suites.
+- [ ] Run on Fedora, review changes, and commit at the actual completion time.
+
+### Phase 25 build and tests
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+./build/test_raft_auth
+python3 tests/test_auth_integration.py ./build/raft-engine
+```
+
+### Phase 25 Git staging list
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_auth.h include/raft_client_auto.h include/raft_tcp.h \
+  include/raft_wire.h src/raft_auth.c src/raft_client_auto.c \
+  src/raft_tcp.c src/raft_wire.c src/main.c \
+  tests/test_raft_auth.c tests/test_auth_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: authenticate raft client identities and gate write admission"
+```
+
+**Next:** Phase 26 — authenticated client/peer transport planning, failure-mode
+hardening and observed security boundaries (not assumed production readiness).

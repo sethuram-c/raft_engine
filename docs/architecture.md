@@ -984,3 +984,34 @@ connection loss can create duplicate log entries. The KV operations SET/DEL
 are idempotent as state assignments/deletions, but their log entries and
 command counts are not deduplicated. Linearizable reads, authentication,
 capacity reservation, throttling and dynamic membership remain outside scope.
+
+## Phase 25: authenticated client-write admission (trust boundary)
+
+New frame type 25 (`CLIENT_WRITE_AUTH`) carries the Phase 23 request format
+(`timeout:u32 || client_id:u64 || request_id:u64 || command:bytes`) followed
+by a 32-byte HMAC-SHA-256 tag. The HMAC input is a domain-separated protocol
+identifier `RAFT25-CLIENT-WRITE-V1` concatenated with the complete request
+body. The server maps the claimed client ID to a distinct provisioned 32-byte
+secret and checks the MAC in constant time before inspecting or changing Raft
+state. Unknown IDs, invalid MACs and malformed requests yield `REJECTED` and
+do not append. A valid message continues through the Phase 23 `dedup_admit`
+path and the Phase 22 majority-commit acknowledgement path; duplicate logical
+requests return the previous commitment and conflicting same-ID commands fail.
+
+Authenticated servers load an owner-only regular server keyring at startup;
+clients read only their own owner-only secret file. All credential files reject
+symlinks, foreign ownership and group/other permission bits. Both the memory
+(`--elect-auth`) and coordinated snapshot-WAL (`--elect-auth-wal`) variants
+support the signed request. Existing `--elect` and storage modes are unchanged.
+Legacy write APIs and unauthenticated diagnostic mutations are explicitly
+blocked in authenticated mode, preventing a bypass through public client
+commands. No file contents, secrets or MAC keys are printed to logs.
+
+**This does not authenticate peer RPCs.** Vote/AppendEntries/InstallSnapshot
+still trust unauthenticated peer identifiers, and STATUS/read responses are not
+protected. The transport uses plain TCP rather than TLS, so a man-in-the-middle
+can observe requests, replay signed frames, or forge success responses. Do not
+expose any of these modes directly to untrusted networks. The security claims
+are confined to local client-write HMAC verification and admission behavior;
+the bounded thread pool is not a denial-of-service defense. Key rotation,
+revocation and transport security are explicitly deferred.

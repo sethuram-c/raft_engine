@@ -36,4 +36,10 @@ int raft_client_auto_write(const raft_cluster_config_t *config,
                             uint64_t client_id, uint64_t request_id,
                             const uint8_t *command, size_t command_length);
 
+/* Phase 25: same leader discovery and retry rules, HMAC-authenticated writes. */
+int raft_client_auto_write_auth(const raft_cluster_config_t *config,
+                                uint32_t overall_timeout_ms, uint64_t client_id,
+                                uint64_t request_id, const char *secret_file,
+                                const uint8_t *command, size_t command_length);
+
 #endif

@@ -56,6 +56,13 @@ int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
                             char *error, size_t capacity);
 
 /* Phase 21: opt-in crash-safe InstallSnapshot+WAL generation format. */
+/* Phase 25: fail-closed authenticated client-write admission.
+ * Peer Raft RPCs and unauthenticated reads are NOT secured. */
+int raft_tcp_elect_auth(const raft_cluster_config_t *config, const char *keyring,
+                       char *error, size_t capacity);
+int raft_tcp_elect_auth_wal(const raft_cluster_config_t *config, const char *directory,
+                           const char *keyring, char *error, size_t capacity);
+
 int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
                                const char *directory, char *error, size_t capacity);
 

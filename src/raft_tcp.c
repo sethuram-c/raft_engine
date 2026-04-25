@@ -14,6 +14,7 @@
 #include "raft_install.h"
 #include "raft_client_write.h"
 #include "raft_dedup.h"
+#include "raft_auth.h"
 #include <stdlib.h>
 
 #include <arpa/inet.h>
@@ -219,6 +220,8 @@ struct tcp_server {
     bool durable;
     bool journal;
     bool storage_failed; /* Read by accept thread only after joining workers. */
+    bool auth_mode;
+    raft_auth_keys_t auth_keys;
     bool snapshot_mode; /* in-memory or opt-in coordinated snapshot WAL */
     raft_install_receiver_t incoming;
     uint8_t *snapshot_bytes; /* encoded snapshot, immutable while server->mutex held */
@@ -471,7 +474,7 @@ static void process_client(int fd, tcp_server_t *server)
         (void)raft_wire_send(fd,RAFT_WIRE_INSTALL_SNAPSHOT_RESPONSE,response,
                              sizeof(response),message,sizeof(message));
     } else if (status == RAFT_WIRE_OK && server->snapshot_mode &&
-               type == RAFT_WIRE_SNAPSHOT_COMPACT_DEMO && length==0) {
+               !server->auth_mode && type == RAFT_WIRE_SNAPSHOT_COMPACT_DEMO && length==0) {
         uint8_t response[17]={0};
         (void)pthread_mutex_lock(&server->mutex);
         raft_node_t *node=&server->vote_node;
@@ -515,12 +518,17 @@ static void process_client(int fd, tcp_server_t *server)
         response[16]=(uint8_t)accepted;
         (void)raft_wire_send(fd,RAFT_WIRE_SNAPSHOT_COMPACT_RESPONSE,response,
                              sizeof(response),message,sizeof(message));
-    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_CLIENT_WRITE_ID) {
+    } else if (status == RAFT_WIRE_OK && (type == RAFT_WIRE_CLIENT_WRITE_ID ||
+               type == RAFT_WIRE_CLIENT_WRITE_AUTH)) {
         raft_dedup_entry_t request;
         raft_client_write_response_t reply={0,0,RAFT_CLIENT_WRITE_REJECTED};
         uint32_t timeout_ms=0;
         uint64_t start_ms=0;
-        int valid=raft_dedup_decode_request(payload,length,&timeout_ms,&request)==0 &&
+        int valid=(type == RAFT_WIRE_CLIENT_WRITE_AUTH ?
+               (server->auth_mode && raft_auth_verify(&server->auth_keys,payload,
+                   length,&timeout_ms,&request)==0) :
+               (!server->auth_mode && raft_dedup_decode_request(payload,length,
+                   &timeout_ms,&request)==0)) &&
                   raft_clock_monotonic_ms(&start_ms)==RAFT_OK;
         if (valid) {
             (void)pthread_mutex_lock(&server->mutex);
@@ -560,9 +568,12 @@ static void process_client(int fd, tcp_server_t *server)
         }
         uint8_t out[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
         if (raft_client_write_encode_response(&reply,out)==0)
-            (void)raft_wire_send(fd,RAFT_WIRE_CLIENT_WRITE_ID_RESPONSE,
+            (void)raft_wire_send(fd,type==RAFT_WIRE_CLIENT_WRITE_AUTH ?
+                                 RAFT_WIRE_CLIENT_WRITE_AUTH_RESPONSE :
+                                 RAFT_WIRE_CLIENT_WRITE_ID_RESPONSE,
                                  out,sizeof(out),message,sizeof(message));
-    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_CLIENT_WRITE) {
+    } else if (status == RAFT_WIRE_OK && !server->auth_mode &&
+               type == RAFT_WIRE_CLIENT_WRITE) {
         /* Bounded synchronous write: a reply says COMMITTED only once a
          * majority-backed index in this leader term is committed. Neither
          * local append nor an acknowledgement from one follower suffices.
@@ -620,7 +631,8 @@ static void process_client(int fd, tcp_server_t *server)
         if (raft_client_write_encode_response(&reply, out) == 0)
             (void)raft_wire_send(fd, RAFT_WIRE_CLIENT_WRITE_RESPONSE, out,
                                  sizeof(out), message, sizeof(message));
-    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_DEMO_PROPOSE &&
+    } else if (status == RAFT_WIRE_OK && !server->auth_mode &&
+               type == RAFT_WIRE_DEMO_PROPOSE &&
                length != 0 && length <= 1024) {
         /* Explicitly educational, unauthenticated command injection.
          * Disabled for followers and --serve; never implies a commit. */
@@ -863,6 +875,8 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
     if (server->snapshot_journal) raft_snapwal_close(&server->snapwal);
     if (server->journal) raft_wal_close(&server->wal);
     raft_storage_close(&server->storage);
+    /* No worker may still access credentials once joined. */
+    raft_auth_clear_keys(&server->auth_keys);
     raft_install_receiver_destroy(&server->incoming);
     free(server->snapshot_bytes);
     raft_kv_destroy(&server->kv);
@@ -1183,7 +1197,8 @@ static void *election_worker_main(void *argument)
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
                           const char *durable_directory, bool journal, bool snapshots,
-                          bool snapshot_journal, char *error, size_t error_capacity)
+                          bool snapshot_journal, const char *auth_keyring,
+                          char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
         return -1;
@@ -1203,6 +1218,16 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
         (void)close(listener);
         return -1;
+    }
+    if (auth_keyring != NULL) {
+        if (raft_auth_read_keyring(auth_keyring,&server.auth_keys)!=0) {
+            report_error(error,error_capacity,
+                         "invalid auth keyring (owner-only regular file required)");
+            (void)close(listener);
+            stop_and_join_workers(&server,false);
+            return -1;
+        }
+        server.auth_mode=true;
     }
     if (durable_directory != NULL) {
         if (snapshot_journal &&
@@ -1417,13 +1442,13 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, NULL, false, false, false, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, false, false, false, NULL, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, NULL, false, false, false, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, false, false, false, NULL, error, error_capacity);
 }
 
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
@@ -1433,7 +1458,7 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
         report_error(error, capacity, "durable directory is required");
         return -1;
     }
-    return tcp_serve_mode(config, 0, true, directory, false, false, false, error, capacity);
+    return tcp_serve_mode(config, 0, true, directory, false, false, false, NULL, error, capacity);
 }
 
 int raft_tcp_elect_wal(const raft_cluster_config_t *config,
@@ -1443,13 +1468,13 @@ int raft_tcp_elect_wal(const raft_cluster_config_t *config,
         report_error(error,capacity,"WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,true,false,false,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,true,false,false,NULL,error,capacity);
 }
 
 int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
                             char *error, size_t capacity)
 {
-    return tcp_serve_mode(config,0,true,NULL,false,true,false,error,capacity);
+    return tcp_serve_mode(config,0,true,NULL,false,true,false,NULL,error,capacity);
 }
 
 int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
@@ -1459,5 +1484,20 @@ int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
         report_error(error, capacity, "snapshot WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,false,true,true,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,false,true,true,NULL,error,capacity);
+}
+
+int raft_tcp_elect_auth(const raft_cluster_config_t *config,
+                       const char *keyring, char *error, size_t capacity)
+{
+    if (!keyring || !*keyring) return -1;
+    return tcp_serve_mode(config,0,true,NULL,false,false,false,keyring,error,capacity);
+}
+
+int raft_tcp_elect_auth_wal(const raft_cluster_config_t *config,
+                           const char *directory, const char *keyring,
+                           char *error, size_t capacity)
+{
+    if (!directory || !*directory || !keyring || !*keyring) return -1;
+    return tcp_serve_mode(config,0,true,directory,false,true,true,keyring,error,capacity);
 }
