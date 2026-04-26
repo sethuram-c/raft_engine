@@ -3,11 +3,11 @@ CPPFLAGS ?= -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -Werror -O0 -g
 LDFLAGS ?=
 THREAD_FLAGS = -pthread
-LDLIBS ?= -lcrypto
+LDLIBS ?= -lssl -lcrypto
 PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c src/raft_client_write.c src/raft_dedup.c src/raft_client_auto.c src/raft_auth.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c src/raft_client_write.c src/raft_dedup.c src/raft_client_auto.c src/raft_auth.c src/raft_tls.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
@@ -48,8 +48,8 @@ $(TEST_NODE): tests/test_raft_node.c src/raft_node.c src/raft_log.c src/raft_tim
 $(TEST_CONFIG): tests/test_raft_config.c src/raft_config.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_config.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
 
-$(TEST_WIRE): tests/test_raft_wire.c src/raft_wire.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_wire.c src/raft_wire.c $(LDFLAGS) $(LDLIBS) -o $@
+$(TEST_WIRE): tests/test_raft_wire.c src/raft_wire.c src/raft_tls.c src/raft_config.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_wire.c src/raft_wire.c src/raft_tls.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_TIMER): tests/test_raft_timer.c src/raft_timer.c src/raft_node.c src/raft_log.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_timer.c src/raft_timer.c src/raft_node.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
@@ -66,8 +66,8 @@ $(TEST_APPEND): tests/test_raft_append.c src/raft_append.c src/raft_node.c src/r
 $(TEST_RECONCILE): tests/test_raft_reconcile.c src/raft_log.c src/raft_node.c src/raft_timer.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_reconcile.c src/raft_log.c src/raft_node.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
 
-$(TEST_REPLICATION): tests/test_raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c src/raft_wire.c $(HEADERS) Makefile | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c src/raft_wire.c $(LDFLAGS) $(LDLIBS) -o $@
+$(TEST_REPLICATION): tests/test_raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c src/raft_wire.c src/raft_tls.c src/raft_config.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c src/raft_wire.c src/raft_tls.c src/raft_config.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(TEST_PROGRESS): tests/test_raft_progress.c src/raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_progress.c src/raft_replication.c src/raft_append.c src/raft_node.c src/raft_log.c src/raft_timer.c $(LDFLAGS) $(LDLIBS) -o $@
@@ -173,6 +173,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_dedup_integration.py ./$(APP)
 	$(PYTHON) tests/test_auto_client_integration.py ./$(APP)
 	$(PYTHON) tests/test_auth_integration.py ./$(APP)
+	$(PYTHON) tests/test_tls_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

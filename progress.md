@@ -859,3 +859,41 @@ git commit -m "feat: authenticate raft client identities and gate write admissio
 
 **Next:** Phase 26 — authenticated client/peer transport planning, failure-mode
 hardening and observed security boundaries (not assumed production readiness).
+
+
+## Phase 26 / 35 — Authenticated Transport and Peer Trust Hardening
+
+- [x] Add opt-in OpenSSL TLS 1.3 with mutual CA certificate verification.
+- [x] Require exact `raft-node-N` SAN on every dialed configured peer.
+- [x] Require a matching configured local `raft-node-N` certificate at startup.
+- [x] Reject incoming Raft RPCs claiming any node ID other than the TLS identity.
+- [x] Require `raft-client` SAN for HMAC client-write RPCs.
+- [x] Retain Phase 25 per-client MAC and Phase 23 deduplication inside TLS.
+- [x] Keep the previous plain-TCP modes and disk formats unchanged.
+- [x] Add TLS CLI server, authenticated writer, and status inspection.
+- [x] Test CA mismatch, unknown SAN, claimed-ID forgery, plaintext rejection,
+      repeated writes, and snapshot-WAL process crash/restart.
+- [x] Preserve and rerun Phase 1–25 regression tests.
+- [ ] Run on your Fedora installation, review the security limits, and commit.
+
+### Phase 26 build and tests
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+python3 tests/test_tls_integration.py ./build/raft-engine
+```
+
+### Git staging (10 new/modified files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_tls.h src/raft_tls.c src/raft_tcp.c src/raft_wire.c \
+  src/main.c tests/test_tls_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: protect raft peer and client RPCs with mutual TLS"
+```
+
+**Next:** Phase 27 — certificate/key lifecycle and transport resource hardening.

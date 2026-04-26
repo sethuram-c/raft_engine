@@ -2,7 +2,32 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 24 / 35 — Automatic Leader Discovery & Safe Client Retries.**
+**Current milestone: Phase 26 / 35 — Mutual TLS Transport & Raft Peer Identity Verification.**
+
+Phase 26 adds **mutual TLS 1.3** for peer Raft RPCs and HMAC-authenticated
+client writes. Each Raft node must present the exact certificate DNS SAN
+`raft-node-ID`. A verified CA chain alone is not enough: incoming votes,
+AppendEntries and snapshots must claim the authenticated sender identity.
+Plain TCP remains only for prior development modes.
+
+### Phase 26 quickstart
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+python3 tests/test_tls_integration.py ./build/raft-engine
+```
+
+For a disposable three-node TLS lab, `tests/test_tls_integration.py`
+**automatically provisions a throwaway CA and certificates**, starts three
+persistent TLS nodes, executes authenticated writes and checks rejected
+spoofed identities and crash recovery. The full manual certificate procedure
+and CLI syntax appear in the Phase 26 section near the end of this README.
+Do not commit key files or expose the educational cluster on a public network.
+
+---
+
+**Earlier milestone: Phase 24 / 35 — Automatic Leader Discovery & Safe Client Retries.**
 
 Phase 24 adds a topology-aware, opt-in `--write-auto` CLI. It discovers
 leaders using the **existing 17-byte STATUS RPC**, selects a unique leader
@@ -1074,4 +1099,112 @@ Run the new tests:
 make clean && make && make test
 ./build/test_raft_auth
 python3 tests/test_auth_integration.py ./build/raft-engine
+```
+
+
+## Phase 26: mutual TLS 1.3 peer/client transport (opt-in)
+
+Phase 26 introduces an opt-in transport boundary that encrypts the **same
+framed Raft protocol** using OpenSSL TLS 1.3. The original plaintext commands
+remain available for backward compatibility, **but do not mix plaintext and
+TLS nodes within one cluster**. TLS protects both requests and replies from
+network observers; TLS mutual certificate authentication and SAN identity
+checks protect against unauthenticated RPC senders.
+
+**Secure durable server:**
+
+```sh
+./build/raft-engine --elect-tls-auth-wal CONFIG DATA_DIR KEYRING NODE_CERT NODE_KEY CA_CERT
+```
+
+**Secure authenticated client:**
+
+```sh
+./build/raft-engine --write-tls-auth-auto CONFIG BUDGET_MS CLIENT_ID REQUEST_ID \
+  CLIENT_SECRET CLIENT_CERT CLIENT_KEY CA_CERT 'SET key value'
+```
+
+**Authenticated status inspection:**
+
+```sh
+./build/raft-engine --status-tls CONFIG PEER_ID CLIENT_CERT CLIENT_KEY CA_CERT
+```
+
+In the TLS-enabled server mode:
+
+1. Each node presents an X.509 certificate with the exact DNS Subject
+   Alternative Name `raft-node-N`, where N is its configured Raft ID.
+2. Every TCP dial to a Raft member verifies the trust chain and the
+   **expected** `raft-node-N` certificate identity (no wildcard/subject-CN
+   fallback). The server verifies the sender's certificate with the same CA.
+3. Incoming RequestVote, AppendEntries and InstallSnapshot RPCs may only
+   claim a node ID equal to that in the client's authenticated certificate.
+4. Client leaf certificates must carry SAN `raft-client`; a valid CA-signed
+   certificate with an unrelated SAN is rejected. Phase 25 HMAC still signs
+   each write and binds the claimed client ID, request ID and command.
+5. Peer certificate and client certificate private keys **never** belong in
+   the source repository or this ZIP. Restrict key access and rotate them
+   deliberately if compromised.
+
+A TLS-only socket will not understand the legacy plaintext `--status` or
+`--write-auth-auto`; use the `*-tls-*` commands for TLS-enabled servers.
+The 4096-byte message-frame limit and the Raft wire schema are unchanged.
+
+### Generate throwaway development certificates
+
+See the complete `tests/test_tls_integration.py` example, which uses OpenSSL
+to make a disposable CA, three node certificates and a client certificate
+with constrained SANs in a temporary directory. For a manual lab, generate
+certificates signed by **one test CA** with these exact DNS SAN values:
+
+| Credential | Required SAN | Used by |
+|---|---|---|
+| node1.crt | `DNS:raft-node-1` | `--elect-tls-auth-wal config/node1.conf` |
+| node2.crt | `DNS:raft-node-2` | `--elect-tls-auth-wal config/node2.conf` |
+| node3.crt | `DNS:raft-node-3` | `--elect-tls-auth-wal config/node3.conf` |
+| client.crt | `DNS:raft-client` | `--status-tls`, `--write-tls-auth-auto` |
+
+Server/client leaf certificates must include `extendedKeyUsage=serverAuth,clientAuth`
+for this educational **shared-role** context, `basicConstraints=CA:FALSE`,
+and a private key matching the certificate. Phase 25 owner-only HMAC keyring
+and secret-file checks remain enabled. The test suite automatically generates
+all material and removes it after the tests.
+
+### Fedora checks
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+python3 tests/test_tls_integration.py ./build/raft-engine
+```
+
+The Phase 26 test exercises a genuine three-process election, TLS client
+reads, HMAC-authenticated writes/retries, TLS certificate validation, denial
+of plaintext access, mismatched local-node identity, a trusted node trying
+to forge another Raft candidate ID, and snapshot-WAL `SIGKILL` recovery.
+The previous phases' complete unit and network tests are retained.
+
+### Security boundaries and known limitations
+
+**This is a development transport, not a production security system.** There
+is no certificate revocation (CRL/OCSP), certificate rotation without restart,
+IP allow-list, transport-level rate limiting, automated CA issuance, client-ID
+to certificate-SAN provisioning, or an external key-management service. The
+CA is the cluster trust anchor: protect its private key offline; any entity
+with that key can issue trusted certificates. The secure mode still exposes
+read-only non-linearizable diagnostic RPCs to authenticated clients, while
+its HMAC write path remains leader- and quorum-gated. TLS protects packets
+*in transit*, not persisted files or a compromised host. No production
+availability or power-loss behavior is claimed.
+
+### Phase 26 staging list (10 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_tls.h src/raft_tls.c src/raft_tcp.c src/raft_wire.c \
+  src/main.c tests/test_tls_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: protect raft peer and client RPCs with mutual TLS"
 ```

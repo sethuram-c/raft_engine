@@ -1015,3 +1015,52 @@ expose any of these modes directly to untrusted networks. The security claims
 are confined to local client-write HMAC verification and admission behavior;
 the bounded thread pool is not a denial-of-service defense. Key rotation,
 revocation and transport security are explicitly deferred.
+
+
+## Phase 26: mutual TLS transport and verified Raft peer identities
+
+**Opt-in deployment only:** `--elect-tls-auth-wal CONFIG DIR HMAC_KEYRING
+NODE_CERT NODE_KEY CA_CERT`. The TLS 1.3 connection carries exactly the
+existing 12-byte RAFT frame header and its length-bounded payload. Only
+`src/raft_wire.c` changes between plain socket I/O and TLS record I/O,
+allowing all prior framing and Raft logic to remain byte-compatible.
+
+`src/raft_tls.c` constructs one read-only OpenSSL context during startup and
+uses a TLS session bound to each request worker or outbound election thread.
+All TLS connections authenticate both endpoint certificates against the
+configured CA and check the peer leaf certificate's **DNS SAN**; X.509
+subject CN fallback and wildcard identities are disallowed. The dialer
+checks `raft-node-PEER_ID`; the listener maps `raft-node-N` to configured
+membership, or `raft-client` for authenticated client RPCs. Raft
+RequestVote, AppendEntries and InstallSnapshot verify their decoded sender
+IDs against that TLS node identity before touching term, timer, log or
+vote state. A configured node also refuses to bind if its own certificate
+SAN does not match its own node ID. The HMAC signer from Phase 25 continues
+to authorize client identities, even after TLS authenticates the connection.
+
+Transport trust boundary:
+
+```
+local TLS node -> TCP -> TLS 1.3 handshake -> trusted CA + raft-node-ID
+                                               -> 12-byte RAFT frame
+                                               -> claimed Raft sender-ID match
+                                               -> Raft state mutation
+
+TLS client cert -> trusted CA + raft-client SAN -> HMAC client-ID check
+                                                -> dedup and quorum wait
+```
+
+`raft_tls_attach_outbound` is called after the bounded TCP dial;
+`raft_tls_attach_inbound` runs before parsing the first incoming frame.
+`raft_tls_read`/`raft_tls_write` are used by the existing framing loops only
+in TLS mode. SSL sessions are owned per thread and cleaned when the server
+worker exits or before the next outbound dial. The existing 8-worker bound
+and per-socket receive/send timeouts still apply; this is not a complete
+TLS handshake DoS defense. Node private keys are never shipped in the
+project bundle.
+
+The secure modes require synchronized CA trust and provisioned identities;
+there is no automatic certificate distribution, revocation, key rotation,
+client SAN-to-ID mapping, authorization policies for diagnostics, or hardened
+production deployment. Plain transport remains available for previous
+unit/integration tests and must not be combined with TLS mode.

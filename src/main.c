@@ -1,6 +1,7 @@
 #include "raft_config.h"
 #include "raft_node.h"
 #include "raft_tcp.h"
+#include "raft_tls.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
@@ -680,7 +681,7 @@ static void usage(void)
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
           "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
-          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND]\n", stderr);
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND | --elect-tls-auth-wal PATH DATA_DIR KEYRING CERT KEY CA | --status-tls PATH PEER_ID CERT KEY CA | --write-tls-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE CERT KEY CA COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -721,6 +722,42 @@ int main(int argc, char **argv)
         return elect_wal_server(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--elect-snapshot-wal") == 0)
         return elect_snapshot_wal_server(argv[2], argv[3]);
+    /* Phase 26: opt-in TLS 1.3 with a trusted CA and mutually authenticated
+     * node/client leaf certificates. In authenticated-WAL mode the HMAC
+     * keyring still controls client ID admission. */
+    if (argc == 8 && strcmp(argv[1], "--elect-tls-auth-wal") == 0) {
+        raft_cluster_config_t config;
+        char error[256];
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[5], argv[6], argv[7], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS setup failed: %s\n", error);
+            return 1;
+        }
+        return elect_auth_server(argv[2], argv[4], argv[3]);
+    }
+    if (argc == 11 && strcmp(argv[1], "--write-tls-auth-auto") == 0) {
+        raft_cluster_config_t config;
+        char error[256];
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[7], argv[8], argv[9], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS setup failed: %s\n", error);
+            return 1;
+        }
+        return client_write_auth_auto(argv[2],argv[3],argv[4],argv[5],argv[6],argv[10]);
+    }
+    if (argc == 7 && strcmp(argv[1], "--status-tls") == 0) {
+        raft_cluster_config_t config;
+        char error[256];
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[4], argv[5], argv[6], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS setup failed: %s\n", error);
+            return 1;
+        }
+        return status_peer(argv[2], argv[3]);
+    }
     if (argc == 4 && strcmp(argv[1], "--elect-auth") == 0)
         return elect_auth_server(argv[2],argv[3],NULL);
     if (argc == 5 && strcmp(argv[1], "--elect-auth-wal") == 0)

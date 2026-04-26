@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "raft_tcp.h"
+#include "raft_tls.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_election.h"
@@ -179,6 +180,16 @@ int raft_tcp_connect(const raft_peer_config_t *peer, int timeout_ms,
         (void)close(fd);
         return -1;
     }
+    if (raft_tls_enabled()) {
+        struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                             .tv_usec = (timeout_ms % 1000) * 1000};
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0 ||
+            raft_tls_attach_outbound(fd, peer->id, error, error_capacity) != 0) {
+            (void)close(fd);
+            return -1;
+        }
+    }
     if (error != NULL && error_capacity != 0) error[0] = '\0';
     return fd;
 }
@@ -340,6 +351,13 @@ static void process_client(int fd, tcp_server_t *server)
             printf("Replied: node=%u bytes=%zu\n", server->node_id, length);
             (void)fflush(stdout);
         }
+    } else if (status == RAFT_WIRE_OK && raft_tls_enabled() &&
+               (type == RAFT_WIRE_CLIENT_WRITE_AUTH ||
+                type == RAFT_WIRE_CLIENT_WRITE_ID ||
+                type == RAFT_WIRE_CLIENT_WRITE) &&
+               !raft_tls_remote_client()) {
+        fputs("Rejected non-client TLS certificate for write RPC\n", stderr);
+        return;
     } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_REQUEST_VOTE) {
         raft_vote_request_t req;
         raft_vote_response_t rsp;
@@ -348,6 +366,7 @@ static void process_client(int fd, tcp_server_t *server)
         if (raft_vote_decode_request(payload, length, &req) != RAFT_OK ||
             raft_config_peer_for_id(&server->config, req.candidate_id) == NULL ||
             req.candidate_id == server->node_id ||
+            (raft_tls_enabled() && raft_tls_remote_node() != req.candidate_id) ||
             raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
             fputs("Rejected malformed RequestVote payload\n", stderr);
             return;
@@ -383,6 +402,7 @@ static void process_client(int fd, tcp_server_t *server)
         if (raft_append_decode_batch(payload, length, &batch) != RAFT_OK ||
             raft_config_peer_for_id(&server->config, batch.header.leader_id) == NULL ||
             batch.header.leader_id == server->node_id ||
+            (raft_tls_enabled() && raft_tls_remote_node() != batch.header.leader_id) ||
             raft_clock_monotonic_ms(&now_ms) != RAFT_OK) {
             fputs("Rejected malformed or nonmember AppendEntries\n", stderr);
             return;
@@ -428,6 +448,7 @@ static void process_client(int fd, tcp_server_t *server)
         if (raft_install_decode_chunk(payload,length,&chunk)!=RAFT_OK ||
             raft_config_peer_for_id(&server->config,chunk.leader_id)==NULL ||
             chunk.leader_id==server->node_id ||
+            (raft_tls_enabled() && raft_tls_remote_node()!=chunk.leader_id) ||
             raft_clock_monotonic_ms(&now_ms)!=RAFT_OK) return;
         raft_install_response_t reply;
         uint8_t response[RAFT_INSTALL_RESPONSE_BYTES];
@@ -758,10 +779,15 @@ static void *tcp_worker_main(void *arg)
     tcp_worker_t *worker = arg;
     tcp_server_t *server = worker->server;
     int fd = worker->client_fd;
-    if (configure_client_timeouts(fd) == 0)
+    char tls_error[256] = {0};
+    if (configure_client_timeouts(fd) == 0 &&
+        raft_tls_attach_inbound(fd, tls_error, sizeof(tls_error)) == 0)
         process_client(fd, server);
+    else if (raft_tls_enabled())
+        fprintf(stderr, "TLS connection rejected: %s\n", tls_error);
     else
         fprintf(stderr, "Client socket timeout setup failed: %s\n", strerror(errno));
+    raft_tls_detach();
 
     /* Closing and clearing the fd under one mutex prevents fd-reuse races
      * with the main thread's concurrent shutdown() on SIGTERM/SIGINT. */
@@ -1202,6 +1228,11 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
         return -1;
+    if (raft_tls_validate_local_node(config->node_id) != 0) {
+        report_error(error, error_capacity,
+                     "local TLS certificate SAN does not match configured node ID");
+        return -1;
+    }
     const raft_peer_config_t *local =
         raft_config_peer_for_id(config, config->node_id);
     int listener = raft_tcp_listen(local, error, error_capacity);

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "raft_wire.h"
+#include "raft_tls.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -119,7 +120,8 @@ static raft_wire_status_t read_exact(int fd, uint8_t *buf, size_t n,
 {
     size_t done = 0;
     while (done < n) {
-        ssize_t got = recv(fd, buf + done, n - done, 0);
+        ssize_t got = raft_tls_enabled() ? raft_tls_read(fd, buf + done, n - done) :
+                      recv(fd, buf + done, n - done, 0);
         if (got > 0) {
             done += (size_t)got;
         } else if (got == 0) {
@@ -140,7 +142,8 @@ static raft_wire_status_t write_exact(int fd, const uint8_t *buf, size_t n,
 {
     size_t done = 0;
     while (done < n) {
-        ssize_t sent = send(fd, buf + done, n - done, MSG_NOSIGNAL);
+        ssize_t sent = raft_tls_enabled() ? raft_tls_write(fd, buf + done, n - done) :
+                       send(fd, buf + done, n - done, MSG_NOSIGNAL);
         if (sent > 0) {
             done += (size_t)sent;
         } else if (sent == 0) {
