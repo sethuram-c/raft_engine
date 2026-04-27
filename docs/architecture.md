@@ -1060,7 +1060,42 @@ TLS handshake DoS defense. Node private keys are never shipped in the
 project bundle.
 
 The secure modes require synchronized CA trust and provisioned identities;
-there is no automatic certificate distribution, revocation, key rotation,
-client SAN-to-ID mapping, authorization policies for diagnostics, or hardened
+there is no automatic certificate distribution, revocation, automated key
+rotation (Phase 27 adds manual SIGHUP reload), client SAN-to-ID mapping,
+authorization policies for diagnostics, or hardened
 production deployment. Plain transport remains available for previous
 unit/integration tests and must not be combined with TLS mode.
+
+
+## Phase 27: live TLS context swap and bounded handshakes
+
+TLS configuration from Phase 26 is now protected by a process-wide
+`pthread_mutex_t`. Each inbound/outbound connection acquires an extra
+OpenSSL context reference while holding that lock and creates an `SSL *`
+which retains its own context reference. When a server receives SIGHUP,
+only the signal handler writes a `volatile sig_atomic_t` flag; the accept
+thread performs file I/O, certificate checks and `SSL_CTX` swap outside the
+signal handler. The old context is released after the swap, but existing
+OpenSSL sessions retain it until their normal detach, so there is no
+concurrent use-after-free. Reload errors never replace the old context.
+
+On certificate replacement, the *local* leaf must still match the exact
+`raft-node-N` SAN; a trusted but wrong identity is rejected. Keys must be
+owner-only regular files (and not symbolic links), owned by the effective
+UID. This does not eliminate pathname TOCTOU in shared/untrusted directories;
+operator-controlled directories remain a requirement.
+
+To prevent a stalled TLS handshake from indefinitely consuming one of the
+eight workers, `raft_tls_attach_*` temporarily makes its fd nonblocking,
+uses SSL WANT_READ/WANT_WRITE plus `poll(CLOCK_MONOTONIC deadline)`, and
+restores its original flags on exit. Inbound deadline: 1200 ms. Outbound
+deadline: 450 ms. This bounds the handshake, not an entire application RPC;
+subsequent RAFT frames retain their previous SO_RCVTIMEO/SO_SNDTIMEO idle
+limits. The existing 16-slot kernel listen backlog is unchanged. TLS
+processes ignore SIGPIPE because OpenSSL socket BIOs may otherwise terminate
+the node on a remote close. Plaintext modes keep their former I/O behavior.
+
+Certificate lifecycle is manual. Trust-bundle overlap allows staged CA
+rollover but a unilateral root removal can cause peer authorization failures.
+No CRL/OCSP, key revocation of established sessions, network rate limiting,
+or production availability guarantees are provided.

@@ -897,3 +897,41 @@ git commit -m "feat: protect raft peer and client RPCs with mutual TLS"
 ```
 
 **Next:** Phase 27 — certificate/key lifecycle and transport resource hardening.
+
+
+## Phase 27 / 35 — Certificate Lifecycle and Transport Resource Hardening
+
+- [x] Add manual SIGHUP reload without restarting Raft or touching WAL data.
+- [x] Swap `SSL_CTX` under a mutex with OpenSSL reference ownership for concurrent sessions.
+- [x] Reject missing/invalid credentials, mismatched-key and incorrect local SAN reloads without losing the last good context.
+- [x] Require owner-only regular private key files (no symlinks, correct UID).
+- [x] Bound inbound TLS handshake to 1200 ms and outbound to 450 ms using nonblocking OpenSSL and monotonic deadline.
+- [x] Continue using the bounded eight-worker pool and 16-connection backlog.
+- [x] Ignore SIGPIPE only in TLS-enabled processes so disconnected peers cannot kill the server.
+- [x] Preserve original plaintext and persistent modes, protocol and disk formats.
+- [x] Add real three-node certificate-rotation, invalid-rotation, idle-handshake, and committed retry integration tests.
+- [x] Verify all earlier unit tests, earlier TLS integration, and live Phase 27 integration.
+- [x] Run new integration tests under Clang ASan/UBSan (LSan disabled for process-lifetime OpenSSL objects).
+- [ ] Recheck on your Fedora host and commit with actual completion date.
+
+### Phase 27 tests
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+python3 tests/test_tls_lifecycle.py ./build/raft-engine
+```
+
+### Phase 27 exact Git staging list (9 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_tls.h src/raft_tls.c src/raft_tcp.c src/main.c \
+  tests/test_tls_lifecycle.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: rotate Raft TLS credentials and bound handshake resources"
+```
+
+**Next:** Phase 28 - metrics, operational visibility and diagnostics.

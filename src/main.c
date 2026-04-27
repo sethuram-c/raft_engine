@@ -734,6 +734,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "TLS setup failed: %s\n", error);
             return 1;
         }
+        if (raft_tls_enable_reload(config.node_id) != 0) {
+            fprintf(stderr, "TLS reload setup failed: local node SAN identity invalid\n");
+            return 1;
+        }
         return elect_auth_server(argv[2], argv[4], argv[3]);
     }
     if (argc == 11 && strcmp(argv[1], "--write-tls-auth-auto") == 0) {

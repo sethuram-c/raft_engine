@@ -174,6 +174,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_auto_client_integration.py ./$(APP)
 	$(PYTHON) tests/test_auth_integration.py ./$(APP)
 	$(PYTHON) tests/test_tls_integration.py ./$(APP)
+	$(PYTHON) tests/test_tls_lifecycle.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

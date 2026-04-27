@@ -1187,8 +1187,9 @@ The previous phases' complete unit and network tests are retained.
 ### Security boundaries and known limitations
 
 **This is a development transport, not a production security system.** There
-is no certificate revocation (CRL/OCSP), certificate rotation without restart,
-IP allow-list, transport-level rate limiting, automated CA issuance, client-ID
+is no certificate revocation (CRL/OCSP), automatic certificate issuance,
+IP allow-list, or connection-rate limiting. Phase 27 adds manual SIGHUP
+leaf/CA reload and an overall TLS handshake deadline, but not automatic renewal, client-ID
 to certificate-SAN provisioning, or an external key-management service. The
 CA is the cluster trust anchor: protect its private key offline; any entity
 with that key can issue trusted certificates. The secure mode still exposes
@@ -1208,3 +1209,76 @@ git diff --cached --stat
 git status
 git commit -m "feat: protect raft peer and client RPCs with mutual TLS"
 ```
+
+
+## Phase 27 — Certificate reload and TLS connection hardening
+
+**No new server command is needed:** continue running `--elect-tls-auth-wal`
+with the certificate, private key and CA file paths from Phase 26. Each
+secure server now installs a SIGHUP handler *after it is ready*. Replace a
+node's leaf certificate and private key at their original paths using atomic
+file replacement, then reload without stopping Raft or deleting any WAL data:
+
+```sh
+# Replace both PEM files using your trusted, out-of-band provisioning tool.
+# Certificate MUST retain DNS SAN raft-node-1 for node 1, and match its key.
+chmod 600 /secure/path/node1.key
+kill -HUP NODE1_PID
+# Inspect the node's stderr for TLS credentials reloaded / reload rejected.
+```
+
+The process continues using its last successful `SSL_CTX` when the incoming
+certificate, key or CA fails to load, the key has group/other permissions, or
+its DNS SAN no longer matches the configured node ID. The server loads new
+credentials *before* atomically swapping the pointer; existing TLS sessions
+retain their old context until they finish. A replacement can temporarily
+pair a new certificate with an old key during provisioning: such reloads
+simply fail, leaving the old context available. Use atomic `rename(2)` for
+**each** credential file, verify both are installed, and only then SIGHUP.
+
+The key file must be a regular file owned by the process effective UID,
+with no group/other bits and no symlink. All TLS sockets use TLS 1.3 with
+session tickets disabled; an overall **1200 ms inbound** or **450 ms outbound**
+handshake deadline bounds stalled handshakes regardless of socket idle
+traffic. Workers remain bounded at **8** with a **16-connection** listening
+backlog. In TLS-enabled processes, SIGPIPE is ignored so disconnected peers
+cannot terminate the Raft node during OpenSSL writes. Plain TCP remains
+compatible with all earlier modes and tests.
+
+**CA rotation:** Use a bundle containing both old and new roots during a
+planned overlap period, reload participating nodes and clients, replace
+certificates, then remove the retired root from all bundles. Reloading one
+node with a new CA only can temporarily break cluster quorum. These are
+manual operator steps, not a coordinated trust-rollover protocol. Already
+established sessions are not forcibly disconnected when a CA or certificate
+is replaced; revocation, KMS/HSM protection, rate limiting, identity
+provisioning and production-grade DoS resistance are still out of scope.
+
+### Phase 27 Fedora verification
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+python3 tests/test_tls_lifecycle.py ./build/raft-engine
+python3 tests/test_tls_integration.py ./build/raft-engine
+```
+
+The new test generates a disposable cluster CA, a renewed node certificate,
+and a rejected same-CA certificate with a wrong SAN. It verifies SIGHUP
+reload, fail-closed reload, restrictive key permissions, eight unfinished
+handshakes, quorum-backed writes, and request-ID deduplication. The preceding
+Phase 26 test is retained.
+
+### Phase 27 complete Git staging list (9 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_tls.h src/raft_tls.c src/raft_tcp.c src/main.c \
+  tests/test_tls_lifecycle.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: rotate Raft TLS credentials and bound handshake resources"
+```
+
+**Next:** Phase 28 — operational observability, metrics and diagnostics.

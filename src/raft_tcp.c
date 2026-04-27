@@ -37,6 +37,13 @@
 #include <stdint.h>
 
 static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t tls_reload_requested = 0;
+
+static void on_reload_signal(int signal_number)
+{
+    (void)signal_number;
+    tls_reload_requested = 1;
+}
 
 /* Idle timeouts bound an unresponsive client; not an overall frame deadline. */
 static int configure_client_timeouts(int fd)
@@ -1370,6 +1377,25 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         return -1;
     }
 
+    struct sigaction previous_hup;
+    bool hup_installed = false;
+    tls_reload_requested = 0;
+    if (raft_tls_reload_enabled()) {
+        struct sigaction hup_action;
+        memset(&hup_action, 0, sizeof(hup_action));
+        hup_action.sa_handler = on_reload_signal;
+        (void)sigemptyset(&hup_action.sa_mask);
+        if (sigaction(SIGHUP, &hup_action, &previous_hup) != 0) {
+            report_error(error, error_capacity, "install SIGHUP handler: %s", strerror(errno));
+            (void)close(listener);
+            stop_and_join_workers(&server, false);
+            (void)sigaction(SIGTERM, &previous_term, NULL);
+            (void)sigaction(SIGINT, &previous_int, NULL);
+            return -1;
+        }
+        hup_installed = true;
+    }
+
     if (elections) {
         code = pthread_create(&server.election_thread, NULL,
                               election_worker_main, &server);
@@ -1377,6 +1403,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             report_error(error, error_capacity, "election worker: %s", strerror(code));
             (void)close(listener);
             stop_and_join_workers(&server, false);
+            if (hup_installed) (void)sigaction(SIGHUP, &previous_hup, NULL);
             (void)sigaction(SIGTERM, &previous_term, NULL);
             (void)sigaction(SIGINT, &previous_int, NULL);
             return -1;
@@ -1392,6 +1419,15 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
 
     while (!stop_requested &&
            (max_connections == 0 || accepted < max_connections)) {
+        if (tls_reload_requested) {
+            tls_reload_requested = 0;
+            char reload_error[256] = {0};
+            if (raft_tls_reload(reload_error, sizeof(reload_error)) == 0)
+                fprintf(stderr, "TLS credentials reloaded for node %u\n", config->node_id);
+            else
+                fprintf(stderr, "TLS reload rejected for node %u: %s\n",
+                        config->node_id, reload_error);
+        }
         reap_finished_workers(&server);
         if (free_worker_slot(&server) == NULL) {
             wait_for_worker(&server);  /* backpressure instead of unbounded threads */
@@ -1459,6 +1495,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         report_error(error, error_capacity, "fatal durable storage failure; node stopped");
         result = -1;
     }
+    if (hup_installed) (void)sigaction(SIGHUP, &previous_hup, NULL);
     (void)sigaction(SIGTERM, &previous_term, NULL);
     (void)sigaction(SIGINT, &previous_int, NULL);
     if (result == 0) {

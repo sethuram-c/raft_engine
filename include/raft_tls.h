@@ -12,6 +12,12 @@ int raft_tls_configure(const char *certificate, const char *private_key,
                        const char *ca_bundle, const raft_cluster_config_t *cluster,
                        char *error, size_t capacity);
 int raft_tls_enabled(void);
+/* Phase 27: enable SIGHUP-triggered hot reload after validating local SAN.
+ * Reload uses the original PEM paths. Replace files atomically before HUP;
+ * failure keeps the last working SSL_CTX in service. */
+int raft_tls_enable_reload(raft_node_id_t node_id);
+int raft_tls_reload_enabled(void);
+int raft_tls_reload(char *error, size_t capacity);
 int raft_tls_validate_local_node(raft_node_id_t node_id);
 int raft_tls_attach_outbound(int fd, raft_node_id_t expected_node,
                              char *error, size_t capacity);
