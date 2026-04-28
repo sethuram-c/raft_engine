@@ -935,3 +935,42 @@ git commit -m "feat: rotate Raft TLS credentials and bound handshake resources"
 ```
 
 **Next:** Phase 28 - metrics, operational visibility and diagnostics.
+
+## Phase 28 / 35 — Raft Observability, Metrics & Operational Diagnostics
+
+- [x] Add 29-field, versioned, read-only metrics schema and bounded binary RPC.
+- [x] Keep Raft state gauges coherent under the node mutex.
+- [x] Use atomic event counters to avoid contention with election/network threads.
+- [x] Instrument votes, elections, leader transitions, replication RPCs,
+      snapshot installations, committed client responses, timeouts, TLS
+      handshake/reload errors, storage failures and connection slot pressure.
+- [x] Calculate current maximum replication lag for a leader's configured followers.
+- [x] Add `--metrics CONFIG PEER_ID` and `--metrics-tls CONFIG PEER_ID CERT KEY CA`.
+- [x] Require mTLS on secure endpoints and avoid exposing secrets/client identities.
+- [x] Preserve older wire and disk formats and original Raft log/node regression tests.
+- [x] Add concurrent unit checks and real 3-node plaintext/mTLS integration coverage.
+- [x] Pass targeted Clang AddressSanitizer and UndefinedBehaviorSanitizer checks.
+- [ ] Rebuild on your Fedora host and commit using your actual completion date.
+
+### Phase 28 commands
+
+```sh
+sudo dnf install gcc make openssl-devel openssl python3
+make clean && make && make test
+./build/test_raft_metrics
+python3 tests/test_metrics_integration.py ./build/raft-engine
+./build/raft-engine --metrics config/node1.conf 1
+```
+
+### Phase 28 changed files (12)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_metrics.h include/raft_wire.h \
+  src/raft_metrics.c src/raft_tcp.c src/raft_wire.c src/main.c \
+  tests/test_raft_metrics.c tests/test_metrics_integration.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "feat: expose bounded raft metrics and operational diagnostics"
+```
+
+**Next:** Phase 29 — operational health and readiness.

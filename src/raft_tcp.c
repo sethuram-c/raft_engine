@@ -16,6 +16,7 @@
 #include "raft_client_write.h"
 #include "raft_dedup.h"
 #include "raft_auth.h"
+#include "raft_metrics.h"
 #include <stdlib.h>
 
 #include <arpa/inet.h>
@@ -224,6 +225,7 @@ struct tcp_server {
     pthread_cond_t worker_changed;
     tcp_worker_t workers[RAFT_TCP_MAX_WORKERS];
     raft_node_id_t node_id;
+    raft_metrics_t metrics; /* Atomic event counters; gauges from node mutex. */
     raft_node_t vote_node; /* Protected by server->mutex. */
     raft_kv_store_t kv;   /* Same mutex, only committed entries are applied. */
     raft_cluster_config_t config; /* Fixed set of allowed candidate IDs. */
@@ -263,6 +265,7 @@ static int durable_checkpoint(tcp_server_t *server)
                                error, sizeof(error)) :
               raft_storage_save(&server->storage, &server->vote_node,
                                error, sizeof(error)))) == 0) return 0;
+    raft_metrics_increment(&server->metrics, RAFT_METRIC_STORAGE_FAILURES);
     fprintf(stderr, "FATAL durable storage failure, halting: %s\n", error);
     server->storage_failed = true;
     atomic_store(&server->election_stop, true);
@@ -351,7 +354,44 @@ static void process_client(int fd, tcp_server_t *server)
     char message[256] = {0};
     raft_wire_status_t status = raft_wire_recv(fd, &type, payload,
                                    sizeof(payload), &length, message, sizeof(message));
-    if (status == RAFT_WIRE_OK && type == RAFT_WIRE_PING) {
+    if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
+        raft_metrics_increment(&server->metrics, RAFT_METRIC_REJECTED_FRAMES);
+    if (status == RAFT_WIRE_OK && type == RAFT_WIRE_METRICS_REQUEST && length == 0 &&
+        (!raft_tls_enabled() || raft_tls_remote_client() || raft_tls_remote_node())) {
+        raft_metrics_sample_t sample;
+        uint8_t result[RAFT_METRICS_WIRE_BYTES];
+        uint64_t now_ms = 0;
+        (void)raft_clock_monotonic_ms(&now_ms);
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_metrics_capture(&server->metrics, &sample);
+        raft_node_t *node = &server->vote_node;
+        sample.value[RAFT_METRIC_NODE_ID] = node->id;
+        sample.value[RAFT_METRIC_UPTIME_MS] = now_ms >= server->metrics.started_ms ?
+            now_ms - server->metrics.started_ms : 0;
+        sample.value[RAFT_METRIC_TERM] = node->current_term;
+        sample.value[RAFT_METRIC_ROLE] = node->role;
+        sample.value[RAFT_METRIC_LAST_LOG_INDEX] = raft_log_last_index(&node->log);
+        sample.value[RAFT_METRIC_COMMIT_INDEX] = node->commit_index;
+        sample.value[RAFT_METRIC_LAST_APPLIED] = node->last_applied;
+        sample.value[RAFT_METRIC_SNAPSHOT_INDEX] = node->log.base_index;
+        sample.value[RAFT_METRIC_MAX_FOLLOWER_LAG] = 0;
+        if (node->role == RAFT_LEADER) {
+            for (size_t i = 0; i < server->config.peer_count; ++i) {
+                if (server->config.peers[i].id == server->node_id ||
+                    server->progress[i].peer_id != server->config.peers[i].id ||
+                    server->progress[i].term != node->current_term) continue;
+                raft_index_t confirmed = server->progress[i].match_index;
+                raft_index_t last = raft_log_last_index(&node->log);
+                uint64_t lag = confirmed < last ? last - confirmed : 0;
+                if (lag > sample.value[RAFT_METRIC_MAX_FOLLOWER_LAG])
+                    sample.value[RAFT_METRIC_MAX_FOLLOWER_LAG] = lag;
+            }
+        }
+        (void)pthread_mutex_unlock(&server->mutex);
+        if (raft_metrics_encode(&sample, result, sizeof(result)) == 0)
+            (void)raft_wire_send(fd, RAFT_WIRE_METRICS_RESPONSE, result,
+                                 sizeof(result), message, sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_PING) {
         status = raft_wire_send(fd, RAFT_WIRE_PONG, payload, length,
                                 message, sizeof(message));
         if (status == RAFT_WIRE_OK) {
@@ -378,6 +418,7 @@ static void process_client(int fd, tcp_server_t *server)
             fputs("Rejected malformed RequestVote payload\n", stderr);
             return;
         }
+        raft_metrics_increment(&server->metrics, RAFT_METRIC_VOTE_REQUESTS);
         (void)pthread_mutex_lock(&server->mutex);
         raft_term_t old_term = server->vote_node.current_term;
         raft_node_id_t old_vote = server->vote_node.voted_for;
@@ -388,6 +429,8 @@ static void process_client(int fd, tcp_server_t *server)
             durable_checkpoint(server) != 0)
             result = RAFT_ERR_INVALID_ARGUMENT;
         (void)pthread_mutex_unlock(&server->mutex);
+        if (result == RAFT_OK && rsp.vote_granted)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_VOTES_GRANTED);
         if (result != RAFT_OK ||
             raft_vote_encode_response(&rsp, output) != RAFT_OK) {
             fputs("Could not process RequestVote\n", stderr);
@@ -414,6 +457,7 @@ static void process_client(int fd, tcp_server_t *server)
             fputs("Rejected malformed or nonmember AppendEntries\n", stderr);
             return;
         }
+        raft_metrics_increment(&server->metrics, RAFT_METRIC_APPEND_REQUESTS);
         (void)pthread_mutex_lock(&server->mutex);
         raft_term_t old_term = server->vote_node.current_term;
         raft_node_id_t old_vote = server->vote_node.voted_for;
@@ -434,6 +478,8 @@ static void process_client(int fd, tcp_server_t *server)
             durable_checkpoint(server) != 0)
             result = RAFT_ERR_INVALID_ARGUMENT;
         (void)pthread_mutex_unlock(&server->mutex);
+        if (result == RAFT_OK && !rsp.success)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_APPEND_REJECTIONS);
         if (result != RAFT_OK ||
             raft_append_encode_response(&rsp, output) != RAFT_OK) {
             fputs("Could not process AppendEntries\n", stderr);
@@ -484,6 +530,7 @@ static void process_client(int fd, tcp_server_t *server)
              server->vote_node.voted_for != server->snapwal.previous.voted_for) &&
             durable_checkpoint(server)!=0) result=RAFT_ERR_INVALID_ARGUMENT;
         if (complete) {
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_SNAPSHOTS_INSTALLED);
             free(server->snapshot_bytes);
             server->snapshot_bytes=complete;
             server->snapshot_length=complete_len;
@@ -594,6 +641,10 @@ static void process_client(int fd, tcp_server_t *server)
                 (void)nanosleep(&pause,NULL);
             }
         }
+        if (reply.status == RAFT_CLIENT_WRITE_COMMITTED)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_CLIENT_COMMITS);
+        if (reply.status == RAFT_CLIENT_WRITE_TIMEOUT)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_CLIENT_TIMEOUTS);
         uint8_t out[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
         if (raft_client_write_encode_response(&reply,out)==0)
             (void)raft_wire_send(fd,type==RAFT_WIRE_CLIENT_WRITE_AUTH ?
@@ -655,6 +706,10 @@ static void process_client(int fd, tcp_server_t *server)
                 (void)nanosleep(&pause, NULL);
             }
         }
+        if (reply.status == RAFT_CLIENT_WRITE_COMMITTED)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_CLIENT_COMMITS);
+        if (reply.status == RAFT_CLIENT_WRITE_TIMEOUT)
+            raft_metrics_increment(&server->metrics, RAFT_METRIC_CLIENT_TIMEOUTS);
         uint8_t out[RAFT_CLIENT_WRITE_RESPONSE_BYTES];
         if (raft_client_write_encode_response(&reply, out) == 0)
             (void)raft_wire_send(fd, RAFT_WIRE_CLIENT_WRITE_RESPONSE, out,
@@ -775,7 +830,8 @@ static void process_client(int fd, tcp_server_t *server)
         (void)raft_wire_send(fd, RAFT_WIRE_STATUS_RESPONSE,
                              out, sizeof(out), message, sizeof(message));
     } else if (status == RAFT_WIRE_OK) {
-        fputs("Rejected frame: expected PING, RequestVote, AppendEntries or empty STATUS request\n", stderr);
+        raft_metrics_increment(&server->metrics, RAFT_METRIC_REJECTED_FRAMES);
+        fputs("Rejected frame: unsupported or malformed request\n", stderr);
     }
     if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
         fprintf(stderr, "Rejected frame: %s\n", message);
@@ -790,11 +846,14 @@ static void *tcp_worker_main(void *arg)
     if (configure_client_timeouts(fd) == 0 &&
         raft_tls_attach_inbound(fd, tls_error, sizeof(tls_error)) == 0)
         process_client(fd, server);
-    else if (raft_tls_enabled())
+    else if (raft_tls_enabled()) {
+        raft_metrics_increment(&server->metrics, RAFT_METRIC_TLS_HANDSHAKE_FAILURES);
         fprintf(stderr, "TLS connection rejected: %s\n", tls_error);
+    }
     else
         fprintf(stderr, "Client socket timeout setup failed: %s\n", strerror(errno));
     raft_tls_detach();
+    raft_metrics_connection_close(&server->metrics);
 
     /* Closing and clearing the fd under one mutex prevents fd-reuse races
      * with the main thread's concurrent shutdown() on SIGTERM/SIGINT. */
@@ -811,6 +870,9 @@ static int tcp_server_init(tcp_server_t *server, raft_node_id_t node_id)
 {
     memset(server, 0, sizeof(*server));
     server->node_id = node_id;
+    uint64_t started_ms = 0;
+    (void)raft_clock_monotonic_ms(&started_ms);
+    raft_metrics_init(&server->metrics, started_ms);
     raft_kv_init(&server->kv);
     raft_install_receiver_init(&server->incoming);
     atomic_init(&server->election_stop, false);
@@ -1034,6 +1096,7 @@ static void *election_worker_main(void *argument)
             request = (raft_vote_request_t){node->current_term, node->id,
                                             index, log_term};
             begin = durable_checkpoint(server) == 0;
+            if (begin) raft_metrics_increment(&server->metrics, RAFT_METRIC_ELECTION_ROUNDS);
             if (begin) printf("Election started: node=%u term=%llu self_votes=1\n",
                    node->id, (unsigned long long)node->current_term);
             (void)fflush(stdout);
@@ -1090,11 +1153,19 @@ static void *election_worker_main(void *argument)
                 raft_append_response_t reply;
                 raft_install_response_t snap_reply={0};
                 if (sending_snapshot) {
-                    if (send_peer_snapshot(peer,payload,payload_length,&snap_reply)!=0)
+                    if (send_peer_snapshot(peer,payload,payload_length,&snap_reply)!=0) {
+                        raft_metrics_increment(&server->metrics, RAFT_METRIC_REPLICATION_RPC_FAILURES);
                         continue;
+                    }
                     reply=(raft_append_response_t){snap_reply.term,snap_reply.accepted};
-                } else if (send_peer_replication(peer,payload,payload_length,&reply)!=0)
+                } else if (send_peer_replication(peer,payload,payload_length,&reply)!=0) {
+                    raft_metrics_increment(&server->metrics, RAFT_METRIC_REPLICATION_RPC_FAILURES);
                     continue; /* network failure retains nextIndex for retry */
+                }
+                raft_metrics_increment(&server->metrics, RAFT_METRIC_REPLICATION_RPC_SUCCESSES);
+                if (!sending_snapshot && reply.success &&
+                    reply.term == heartbeat_term && entries)
+                    raft_metrics_add(&server->metrics, RAFT_METRIC_ENTRIES_SENT, entries);
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
                 raft_role_t old = server->vote_node.role;
@@ -1198,6 +1269,7 @@ static void *election_worker_main(void *argument)
                                             peer->id, &reply, now);
                 if (previous == RAFT_CANDIDATE &&
                     server->vote_node.role == RAFT_LEADER) {
+                    raft_metrics_increment(&server->metrics, RAFT_METRIC_LEADER_TRANSITIONS);
                     printf("Leader elected: node=%u term=%llu votes=%u/3\n",
                            server->node_id,
                            (unsigned long long)server->vote_node.current_term,
@@ -1422,11 +1494,14 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         if (tls_reload_requested) {
             tls_reload_requested = 0;
             char reload_error[256] = {0};
-            if (raft_tls_reload(reload_error, sizeof(reload_error)) == 0)
+            if (raft_tls_reload(reload_error, sizeof(reload_error)) == 0) {
+                raft_metrics_increment(&server.metrics, RAFT_METRIC_TLS_RELOAD_SUCCESSES);
                 fprintf(stderr, "TLS credentials reloaded for node %u\n", config->node_id);
-            else
+            } else {
+                raft_metrics_increment(&server.metrics, RAFT_METRIC_TLS_RELOAD_FAILURES);
                 fprintf(stderr, "TLS reload rejected for node %u: %s\n",
                         config->node_id, reload_error);
+            }
         }
         reap_finished_workers(&server);
         if (free_worker_slot(&server) == NULL) {
@@ -1458,6 +1533,7 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
             break;
         }
         ++accepted;
+        raft_metrics_increment(&server.metrics, RAFT_METRIC_CONNECTIONS_ACCEPTED);
         /* Preserve detailed connection logging for passive --serve demos.
          * Heartbeats create many short-lived connections in --elect mode;
          * logging each accepted socket would flood stdout and skew timing. */
@@ -1477,8 +1553,10 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         worker->server = &server;
         worker->finished = false;
         worker->in_use = true;
+        raft_metrics_connection_open(&server.metrics);
         code = pthread_create(&worker->thread, NULL, tcp_worker_main, worker);
         if (code != 0) {
+            raft_metrics_connection_close(&server.metrics);
             worker->in_use = false;
             (void)close(client);
             report_error(error, error_capacity, "pthread_create: %s", strerror(code));

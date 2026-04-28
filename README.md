@@ -1282,3 +1282,93 @@ git commit -m "feat: rotate Raft TLS credentials and bound handshake resources"
 ```
 
 **Next:** Phase 28 — operational observability, metrics and diagnostics.
+
+## Phase 28 — Raft Observability, Metrics and Operational Diagnostics
+
+Phase 28 adds a read-only operational metrics RPC to all existing server modes.
+It does not change election/consensus rules, disk formats, HMACs, or the
+previous `--status`, `--log-status` and `--apply-status` commands. The fixed
+schema is version 1; counters are atomic and **reset when a process restarts**.
+Node state gauges are taken under the existing node mutex.
+
+```sh
+make clean && make && make test
+./build/raft-engine --elect config/node1.conf    # terminal 1
+./build/raft-engine --elect config/node2.conf    # terminal 2
+./build/raft-engine --elect config/node3.conf    # terminal 3
+./build/raft-engine --metrics config/node1.conf 1  # fourth terminal
+./build/raft-engine --metrics config/node1.conf 2
+./build/raft-engine --metrics config/node1.conf 3
+```
+
+The CLI prints one stable `raft_<metric> <unsigned-integer>` line per field.
+Important gauges: `role` (0 follower, 1 candidate, 2 leader), `current_term`,
+`last_log_index`, `commit_index`, `last_applied`, `snapshot_index`,
+`max_follower_lag` (leader-only maximum `lastLogIndex - matchIndex`).
+Important counters: `election_rounds_total`, `leader_transitions_total`,
+`vote_requests_total`, `votes_granted_total`, `append_requests_total`,
+`append_rejections_total`, `replication_rpc_failures_total`,
+`replication_rpc_successes_total`, `entries_sent_total`, `client_commits_total`,
+`client_timeouts_total`, `snapshots_installed_total`,
+`tls_handshake_failures_total`, `tls_reload_successes_total`,
+`tls_reload_failures_total`, `connections_accepted_total`,
+`connections_active`, `connections_peak`, `rejected_frames_total`, and
+`storage_failures_total`.
+
+For the TLS server from Phase 26/27, query with an **authorized raft-client mTLS
+certificate** (or an authorized Raft node certificate):
+
+```sh
+./build/raft-engine --metrics-tls config/node1.conf 1 \
+  /secure/raft/client.crt /secure/raft/client.key /secure/raft/ca-bundle.crt
+```
+
+A plaintext request to an mTLS server fails. In plaintext development modes,
+metrics themselves are **unauthenticated** and must not be made reachable from
+untrusted networks. Export no commands, credential bytes, certificate
+contents, HMAC identities, or per-client data. Metrics use **no HTTP endpoint**
+or Prometheus daemon; the CLI is a read-only snapshot over the existing Raft
+framed TCP protocol (request type 27, response 28). The `RMET` payload is an
+8-byte schema header followed by 29 big-endian 64-bit integers (240 bytes).
+Unknown protocol versions/counts and invalid index invariants are rejected.
+
+These counters are diagnostic, **not durable consensus state**. A commit
+acknowledgement counter counts successful client responses (including same-ID
+retry responses), not necessarily distinct committed operations. RPC success
+means a well-formed response was received, not necessarily that the follower
+accepted the log prefix. `rejected_frames_total` includes framing and generic
+unsupported requests, but is **not** a complete audit log of every rejected
+Raft semantic request. A TLS handshake failure is counted on the inbound
+worker; a reload failure is counted only while the process remains running.
+The gauges are sampled under one node lock but event counters can change
+concurrently; scraping nodes does not yield a globally atomic cluster view.
+
+Focused Phase 28 tests:
+
+```sh
+./build/test_raft_metrics
+python3 tests/test_metrics_integration.py ./build/raft-engine
+```
+
+The integration test exercises leader election, majority-committed writes,
+one offline follower with elevated lag and failed RPC counts, invalid metrics
+frames, worker pressure, mTLS metrics access and rejection of plaintext/wrong
+certificate identities. Operational counters are intentionally bounded and
+fixed-schema; future versions should offer a carefully authenticated scrape
+endpoint, sampling/histograms, and alert rules without holding consensus locks
+across I/O.
+
+### Phase 28 complete Git staging list (12 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_metrics.h include/raft_wire.h \
+  src/raft_metrics.c src/raft_tcp.c src/raft_wire.c src/main.c \
+  tests/test_raft_metrics.c tests/test_metrics_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: expose bounded raft metrics and operational diagnostics"
+```
+
+**Next:** Phase 29 — Health checks and safer operational readiness signals.

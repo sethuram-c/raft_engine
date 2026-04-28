@@ -2,6 +2,7 @@
 #include "raft_node.h"
 #include "raft_tcp.h"
 #include "raft_tls.h"
+#include "raft_metrics.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
@@ -263,6 +264,56 @@ static int status_peer(const char *path, const char *peer_text)
     if (response_id != id) return 1;
     printf("Status: node=%u role=%s term=%llu voted_for=%u\n", response_id,
            raft_role_name((raft_role_t)data[12]), (unsigned long long)term, voted);
+    return 0;
+}
+
+static int parse_decimal_u64(const char *text, uint64_t *out);
+
+/* Phase 28 read-only, versioned operational snapshot. The mTLS variant
+ * configures the same client credentials as --status-tls before connecting. */
+static int metrics_peer(const char *path, const char *peer_text)
+{
+    raft_cluster_config_t config;
+    uint64_t id = 0;
+    if (load_config(path, &config) != 0 ||
+        parse_decimal_u64(peer_text, &id) != 0 ||
+        id == 0 || id > UINT32_MAX) return 1;
+    const raft_peer_config_t *peer = raft_config_peer_for_id(&config, (raft_node_id_t)id);
+    if (!peer) return 1;
+    char error[256] = {0};
+    int fd = raft_tcp_connect(peer, RAFT_TCP_CONNECT_TIMEOUT_MS, error, sizeof(error));
+    if (fd < 0) {
+        fprintf(stderr, "Metrics connection: %s\n", error);
+        return 1;
+    }
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    int ok = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
+             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+    raft_wire_status_t status = RAFT_WIRE_IO;
+    raft_wire_type_t type = RAFT_WIRE_PING;
+    uint8_t response[RAFT_METRICS_WIRE_BYTES];
+    size_t length = 0;
+    if (ok) {
+        status = raft_wire_send(fd, RAFT_WIRE_METRICS_REQUEST, NULL, 0,
+                                error, sizeof(error));
+        if (status == RAFT_WIRE_OK)
+            status = raft_wire_recv(fd, &type, response, sizeof(response),
+                                    &length, error, sizeof(error));
+    }
+    raft_tls_detach();
+    (void)close(fd);
+    raft_metrics_sample_t sample;
+    if (!ok || status != RAFT_WIRE_OK || type != RAFT_WIRE_METRICS_RESPONSE ||
+        raft_metrics_decode(response, length, &sample) != 0 ||
+        sample.value[RAFT_METRIC_NODE_ID] != id) {
+        fprintf(stderr, "Metrics response invalid or unavailable: %s\n",
+                status == RAFT_WIRE_OK ? "bad schema/identity" : error);
+        return 1;
+    }
+    printf("Metrics: node=%llu source=live volatile=1\n", (unsigned long long)id);
+    for (int i = 0; i < RAFT_METRIC_COUNT; ++i)
+        printf("raft_%s %llu\n", raft_metrics_name((raft_metric_id_t)i),
+               (unsigned long long)sample.value[i]);
     return 0;
 }
 
@@ -681,7 +732,7 @@ static void usage(void)
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
           "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
-          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND | --elect-tls-auth-wal PATH DATA_DIR KEYRING CERT KEY CA | --status-tls PATH PEER_ID CERT KEY CA | --write-tls-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE CERT KEY CA COMMAND]\n", stderr);
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND | --elect-tls-auth-wal PATH DATA_DIR KEYRING CERT KEY CA | --status-tls PATH PEER_ID CERT KEY CA | --metrics PATH PEER_ID | --metrics-tls PATH PEER_ID CERT KEY CA | --write-tls-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE CERT KEY CA COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -751,6 +802,17 @@ int main(int argc, char **argv)
         }
         return client_write_auth_auto(argv[2],argv[3],argv[4],argv[5],argv[6],argv[10]);
     }
+    if (argc == 7 && strcmp(argv[1], "--metrics-tls") == 0) {
+        raft_cluster_config_t config;
+        char error[256] = {0};
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[4], argv[5], argv[6], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS metrics setup failed: %s\n", error);
+            return 1;
+        }
+        return metrics_peer(argv[2], argv[3]);
+    }
     if (argc == 7 && strcmp(argv[1], "--status-tls") == 0) {
         raft_cluster_config_t config;
         char error[256];
@@ -770,6 +832,8 @@ int main(int argc, char **argv)
         return compact_wal_offline(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--status") == 0)
         return status_peer(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--metrics") == 0)
+        return metrics_peer(argv[2], argv[3]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)
         return serve(argv[2], 0);
     if (argc == 5 && strcmp(argv[1], "--serve") == 0 &&

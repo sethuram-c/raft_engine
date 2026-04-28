@@ -1099,3 +1099,60 @@ Certificate lifecycle is manual. Trust-bundle overlap allows staged CA
 rollover but a unilateral root removal can cause peer authorization failures.
 No CRL/OCSP, key revocation of established sessions, network rate limiting,
 or production availability guarantees are provided.
+
+## Phase 28 — Operational telemetry design
+
+The Phase 28 **operational metrics RPC** is a non-mutating query which uses
+frame types 27 (`METRICS_REQUEST`, empty body) and 28 (`METRICS_RESPONSE`).
+Its v1 body contains exactly 240 bytes:
+
+```
+Offset   Bytes   Meaning
+0        4       ASCII RMET
+4        2       schema version, big-endian u16 = 1
+6        2       field count, big-endian u16 = 29
+8        232     29 ordered big-endian u64 values
+```
+
+`include/raft_metrics.h` is the authoritative field order. It deliberately
+contains no client identities, key/value bytes, certificate details, commands,
+raw endpoints or HMAC material. The receiver rejects wrong length, count,
+version, role, index ordering and impossible active/peak connection gauges,
+without partially overwriting its caller's output.
+
+`tcp_server_t.metrics` is initialized at process start. Increment-only event
+counters use C11 atomic relaxed operations; `connections_active` increments
+before starting a worker and decrements on worker exit; the peak is updated
+using an atomic compare/exchange loop. The single `server->mutex` protects
+`raft_node_t` and per-follower replication progress. To collect a sample,
+`process_client()` acquires that mutex, copies atomic counters, reads term,
+role, last/commit/applied/snapshot indices, computes the largest follower lag,
+then unlocks **before** encoding and sending its TCP reply. The election worker
+and client workers never hold the node mutex during network I/O for metrics.
+
+Important semantics:
+
+- `max_follower_lag`: `lastLogIndex - matchIndex` for current-term tracked
+  followers when the local node is leader; zero when not a leader. It is not
+  a measure of elapsed time and is distinct from `commitIndex`.
+- `client_commits_total`: committed response events. Duplicated, safely
+  retried requests can produce more than one `COMMITTED` response, so this is
+  **not** a unique-command counter.
+- `replication_rpc_successes_total`: network round trips with decoded
+  responses, including legitimate AppendEntries rejection. Failed dials,
+  timeouts and invalid responses increment `replication_rpc_failures_total`.
+- `entries_sent_total`: entries in successfully acknowledged AppendEntries
+  batches, **not** unique committed entries. Retransmissions may be counted.
+- `rejected_frames_total`: rejected wire framing and unsupported/generic
+  requests; not an exhaustive account of invalid semantic Raft requests.
+- Uptime/counters are process lifetime only, **never WAL-persisted**.
+- The snapshot read itself is not a linearizable cluster operation; nodes may
+  be scraped at different instants.
+
+Security: plaintext development modes expose unauthenticated diagnostics
+only inside a trusted test network. TLS-enabled nodes use the existing mutual
+TLS handshake and SAN authorization, and metrics return only to an authorized
+`raft-client` or configured `raft-node-ID` identity. No separate HTTP endpoint
+is introduced. Transport pressure remains bounded by the eight-worker pool;
+a metrics query consumes a normal worker slot and is subject to the same
+frame limits and TLS handshake deadlines as other RPCs.
