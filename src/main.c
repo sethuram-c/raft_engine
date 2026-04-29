@@ -3,6 +3,7 @@
 #include "raft_tcp.h"
 #include "raft_tls.h"
 #include "raft_metrics.h"
+#include "raft_health.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
 #include "raft_replicate_client.h"
@@ -315,6 +316,101 @@ static int metrics_peer(const char *path, const char *peer_text)
         printf("raft_%s %llu\n", raft_metrics_name((raft_metric_id_t)i),
                (unsigned long long)sample.value[i]);
     return 0;
+}
+
+
+/* Phase 29: one bounded read-only health RPC. Liveness means the server
+ * answered; readiness is an operational heuristic, not a Raft lease.
+ * TLS callers must configure the existing authenticated context first. */
+static int fetch_health(const raft_cluster_config_t *config, raft_node_id_t id,
+                        raft_health_sample_t *out)
+{
+    const raft_peer_config_t *peer = raft_config_peer_for_id(config, id);
+    if (!peer || !out) return -1;
+    char error[256] = {0};
+    int fd = raft_tcp_connect(peer, 650, error, sizeof(error));
+    if (fd < 0) return -1;
+    struct timeval timeout = {.tv_sec = 0, .tv_usec = 700000};
+    raft_wire_status_t status = RAFT_WIRE_IO;
+    raft_wire_type_t reply_type = RAFT_WIRE_PING;
+    uint8_t reply[RAFT_HEALTH_WIRE_BYTES];
+    size_t length = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0) {
+        status = raft_wire_send(fd, RAFT_WIRE_HEALTH_REQUEST, NULL, 0,
+                                error, sizeof(error));
+        if (status == RAFT_WIRE_OK)
+            status = raft_wire_recv(fd, &reply_type, reply, sizeof(reply),
+                                    &length, error, sizeof(error));
+    }
+    raft_tls_detach();
+    (void)close(fd);
+    raft_health_sample_t tmp;
+    if (status != RAFT_WIRE_OK || reply_type != RAFT_WIRE_HEALTH_RESPONSE ||
+        raft_health_decode(reply, length, &tmp) != 0 || tmp.node_id != id)
+        return -1;
+    *out = tmp;
+    return 0;
+}
+
+static int health_peer(const char *path, const char *id_text)
+{
+    raft_cluster_config_t config;
+    uint64_t id = 0;
+    if (load_config(path, &config) != 0 ||
+        parse_decimal_u64(id_text, &id) != 0 || id == 0 || id > UINT32_MAX ||
+        raft_config_peer_for_id(&config, (raft_node_id_t)id) == NULL) return 1;
+    raft_health_sample_t sample;
+    if (fetch_health(&config, (raft_node_id_t)id, &sample) != 0) {
+        fprintf(stderr, "Health: node=%llu live=0 (unreachable or invalid response)\n",
+                (unsigned long long)id);
+        return 1;
+    }
+    printf("Health: node=%u live=1 write_ready=%d role=%s term=%llu "
+           "elections=%d storage_ok=%d quorum_recent=%d commit=%llu applied=%llu "
+           "quorum_age_ms=", sample.node_id, raft_health_write_ready(&sample),
+           raft_role_name((raft_role_t)sample.role), (unsigned long long)sample.term,
+           !!(sample.flags & RAFT_HEALTH_ELECTION_ENABLED),
+           !!(sample.flags & RAFT_HEALTH_STORAGE_OK),
+           !!(sample.flags & RAFT_HEALTH_QUORUM_RECENT),
+           (unsigned long long)sample.commit_index,
+           (unsigned long long)sample.last_applied);
+    if (sample.quorum_age_ms == UINT64_MAX) printf("unknown");
+    else printf("%llu", (unsigned long long)sample.quorum_age_ms);
+    printf(" uptime_ms=%llu\n", (unsigned long long)sample.uptime_ms);
+    return 0;
+}
+
+static int cluster_ready(const char *path)
+{
+    raft_cluster_config_t config;
+    if (load_config(path, &config) != 0) return 1;
+    unsigned reachable = 0, claimed_leaders = 0, ready_leaders = 0;
+    raft_node_id_t leader_id = 0;
+    uint64_t leader_term = 0;
+    uint64_t highest_observed_term = 0;
+    for (size_t i = 0; i < config.peer_count; ++i) {
+        raft_health_sample_t sample;
+        if (fetch_health(&config, config.peers[i].id, &sample) != 0) continue;
+        ++reachable;
+        if (sample.term > highest_observed_term) highest_observed_term = sample.term;
+        if (sample.role == RAFT_LEADER) ++claimed_leaders;
+        if (raft_health_write_ready(&sample)) {
+            ++ready_leaders;
+            leader_id = sample.node_id;
+            leader_term = sample.term;
+        }
+    }
+    int ready = ready_leaders == 1 && claimed_leaders == 1 &&
+                highest_observed_term <= leader_term;
+    if (ready)
+        printf("Readiness: ready=1 leader=%u term=%llu reachable=%u/%zu\n",
+               leader_id, (unsigned long long)leader_term, reachable, config.peer_count);
+    else
+        printf("Readiness: ready=0 leader=unknown reachable=%u/%zu "
+               "(no fresh leader quorum, transition, or conflicting reports)\n",
+               reachable, config.peer_count);
+    return ready ? 0 : 2;
 }
 
 static int probe(const char *path, const char *peer_id_text)
@@ -732,7 +828,7 @@ static void usage(void)
           "--request-vote PATH PEER_ID TERM LAST_INDEX LAST_TERM | "
           "--append-demo PATH PEER_ID TERM PREV_INDEX PREV_TERM COMMAND | "
           "--log-status PATH PEER_ID | --apply-status PATH PEER_ID | "
-          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND | --elect-tls-auth-wal PATH DATA_DIR KEYRING CERT KEY CA | --status-tls PATH PEER_ID CERT KEY CA | --metrics PATH PEER_ID | --metrics-tls PATH PEER_ID CERT KEY CA | --write-tls-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE CERT KEY CA COMMAND]\n", stderr);
+          "--get-demo PATH PEER_ID KEY | --propose-demo PATH LEADER_ID COMMAND | --write PATH PEER_ID TIMEOUT_MS COMMAND | --write-id PATH PEER_ID TIMEOUT_MS CLIENT_ID REQUEST_ID COMMAND | --write-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID COMMAND | --elect-auth PATH KEYRING | --elect-auth-wal PATH DATA_DIR KEYRING | --write-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE COMMAND | --elect-tls-auth-wal PATH DATA_DIR KEYRING CERT KEY CA | --status-tls PATH PEER_ID CERT KEY CA | --metrics PATH PEER_ID | --metrics-tls PATH PEER_ID CERT KEY CA | --health PATH PEER_ID | --health-tls PATH PEER_ID CERT KEY CA | --ready PATH | --ready-tls PATH CERT KEY CA | --write-tls-auth-auto PATH BUDGET_MS CLIENT_ID REQUEST_ID SECRET_FILE CERT KEY CA COMMAND]\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -802,6 +898,28 @@ int main(int argc, char **argv)
         }
         return client_write_auth_auto(argv[2],argv[3],argv[4],argv[5],argv[6],argv[10]);
     }
+    if (argc == 6 && strcmp(argv[1], "--ready-tls") == 0) {
+        raft_cluster_config_t config;
+        char error[256] = {0};
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[3], argv[4], argv[5], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS readiness setup failed: %s\n", error);
+            return 1;
+        }
+        return cluster_ready(argv[2]);
+    }
+    if (argc == 7 && strcmp(argv[1], "--health-tls") == 0) {
+        raft_cluster_config_t config;
+        char error[256] = {0};
+        if (load_config(argv[2], &config) != 0 ||
+            raft_tls_configure(argv[4], argv[5], argv[6], &config,
+                               error, sizeof(error)) != 0) {
+            fprintf(stderr, "TLS health setup failed: %s\n", error);
+            return 1;
+        }
+        return health_peer(argv[2], argv[3]);
+    }
     if (argc == 7 && strcmp(argv[1], "--metrics-tls") == 0) {
         raft_cluster_config_t config;
         char error[256] = {0};
@@ -834,6 +952,10 @@ int main(int argc, char **argv)
         return status_peer(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--metrics") == 0)
         return metrics_peer(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--health") == 0)
+        return health_peer(argv[2], argv[3]);
+    if (argc == 3 && strcmp(argv[1], "--ready") == 0)
+        return cluster_ready(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--serve") == 0)
         return serve(argv[2], 0);
     if (argc == 5 && strcmp(argv[1], "--serve") == 0 &&

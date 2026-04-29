@@ -1156,3 +1156,75 @@ TLS handshake and SAN authorization, and metrics return only to an authorized
 is introduced. Transport pressure remains bounded by the eight-worker pool;
 a metrics query consumes a normal worker slot and is subject to the same
 frame limits and TLS handshake deadlines as other RPCs.
+
+## Phase 29 — Read-only liveness and readiness protocol
+
+Phase 29 keeps operational health separate from the Raft state machine and
+its durable consensus state. Transport liveness is proven by a successfully
+decoded health reply on a bounded TCP/TLS connection. This does not assert
+that the receiver currently holds a Raft quorum.
+
+### Wire format
+
+```
+Frame: type 29 HEALTH_REQUEST, zero bytes
+Frame: type 30 HEALTH_RESPONSE, exactly 52 bytes
+Offset  Size   Field
+ 0       4    ASCII "RHLT"
+ 4       1    Schema version = 1
+ 5       1    Role: follower=0, candidate=1, leader=2
+ 6       1    Flags: bit 0 elections, bit 1 storage OK,
+                 bit 2 recent successful same-term peer reply,
+                 bit 3 write-ready
+ 7       1    Reserved zero
+ 8       4    Node ID, big-endian u32
+12       8    Current term, big-endian u64
+20       8    Commit index, big-endian u64
+28       8    Last-applied index, big-endian u64
+36       8    Recent peer-ack age, big-endian u64; UINT64_MAX means unknown
+44       8    Process uptime in monotonic milliseconds, big-endian u64
+```
+
+All encoders and decoders validate role, node ID, reserved bits, applied <=
+committed, and consistency between flags and quorum age. Invalid input does
+not partially overwrite the caller's output. Version 1 reuses the Phase 5
+framing protocol without changing other message types or disk formats.
+
+### Conservative write-readiness signal
+
+For fixed three-node membership, a leader records the monotonic timestamp
+and term of the last **successful** same-term AppendEntries/snapshot response
+from another configured voter. This is updated only while holding the node
+mutex, after a decoded response proves a same-term successful acknowledgement.
+On election to a new term, the observation is invalidated. A health handler
+reads it, role, term and storage status under the same mutex, then drops the
+lock **before network output**. The pure `raft_health_evaluate()` computes:
+
+```
+write_ready = (role == LEADER)
+           && election_worker_enabled
+           && !fail_stop_storage_error
+           && recent_successful_peer_ack_in_current_term
+           && monotonic_ack_age <= 3000 ms
+```
+
+A single peer acknowledgement is enough *only because the cluster has a fixed
+majority of two among three*. The signal does not cover variable cluster
+membership or joint consensus. It is an operational indicator and is not a
+read-index, quorum lease, proof that the latest entry is committed, or a
+replacement for Phase 22's majority-commit acknowledgement.
+
+`--health CONFIG ID` returns successful liveness (0) even if the sampled node
+is a follower, candidate or isolated leader. `--ready CONFIG` probes all
+configured endpoints sequentially with bounded socket deadlines. It reports
+ready only when exactly one node is a write-ready leader, no other accessible
+node reports a leader role, and no accessible node reports a higher term.
+This is deliberately conservative and not an atomic cluster observation;
+reports can change between probe times. An unavailable peer is not itself
+a verdict about consensus safety. `--ready-tls` and `--health-tls` preserve
+Phase 26/27 certificate authentication and authorization.
+
+Tests cover offline followers, an isolated but live leader, readiness expiry,
+restoration on peer return, standalone liveness, malformed wire frames, fixed
+codec invariants, plaintext rejection on TLS endpoints, and unauthorized TLS
+certificates. Counters from Phase 28 are intentionally unchanged.

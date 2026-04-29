@@ -1372,3 +1372,86 @@ git commit -m "feat: expose bounded raft metrics and operational diagnostics"
 ```
 
 **Next:** Phase 29 — Health checks and safer operational readiness signals.
+
+## Phase 29 — Operational Liveness and Write Readiness
+
+Phase 29 adds a **non-mutating, versioned health RPC** to all server modes. It
+answers two different questions: is the node responding to requests
+(**liveness**), and is the node presently a leader with evidence of recent
+same-term quorum contact (**operational write readiness**)? A successful
+health RPC is proof of liveness for that single request; it is not proof that
+the cluster can currently commit a new write. The `--ready` command compares
+health replies from all configured nodes and deliberately refuses ambiguous
+or conflicting leader reports.
+
+```sh
+make clean && make && make test
+./build/test_raft_health
+python3 tests/test_health_integration.py ./build/raft-engine
+
+# With the three --elect nodes running, any terminal:
+./build/raft-engine --health config/node1.conf 1
+./build/raft-engine --health config/node1.conf 2
+./build/raft-engine --health config/node1.conf 3
+./build/raft-engine --ready config/node1.conf
+```
+
+An accessible follower reports `live=1 write_ready=0`. A leader reports
+`write_ready=1` only while (1) automatic elections are enabled, (2) the node
+has not entered fail-stop storage shutdown, and (3) at least one other voting
+peer has **successfully acknowledged** same-term AppendEntries (or snapshot
+transfer) within the last **3,000 monotonic milliseconds**. For this fixed
+three-node configuration, leader plus one other voter is a majority. The
+observation expires if both peers become unavailable; an isolated leader can
+remain **live** while its readiness becomes **false**. This is a heuristic:
+readiness is NOT a lease, a linearizable read guarantee, a durable health
+record, a verified current quorum, or an authorization to bypass normal Raft
+write acknowledgements. Failure of the health probe is also not a proof that
+Raft has permanently failed.
+
+The CLI returns exit code **0** for a successful `--health` request even if
+`write_ready=0`; exit **1** means unreachable, unauthenticated or invalid
+response. `--ready` returns **0** only when exactly one reachable node
+reports recent-quorum write readiness, no other reachable node claims to be a
+leader, and no reachable node reports a higher term; it returns **2** for an
+unready/ambiguous cluster, **1** for invalid configuration. A missing follower
+can be tolerated; readiness is intentionally conservative when reports
+conflict. All probes use finite connection and socket timeouts.
+
+The new wire types are 29 (`HEALTH_REQUEST`, **empty body**) and 30
+(`HEALTH_RESPONSE`, **52 bytes**). The body is a big-endian, version-1 `RHLT`
+record containing node ID, role, flags, term, commit index, applied index,
+quorum-ack age and uptime. `quorum_age_ms=unknown` means no **fresh**
+same-term acknowledgement. No secrets, commands, client IDs or TLS material
+are sent. Invalid schemas and impossible flag combinations are rejected.
+
+For mutual TLS servers, use authorized client credentials:
+
+```sh
+./build/raft-engine --health-tls config/node1.conf 1 \
+  /secure/raft/client.crt /secure/raft/client.key /secure/raft/ca-bundle.crt
+./build/raft-engine --ready-tls config/node1.conf \
+  /secure/raft/client.crt /secure/raft/client.key /secure/raft/ca-bundle.crt
+```
+
+As before, plaintext development modes expose read-only diagnostics without
+authentication and must be isolated from untrusted networks. TLS endpoints
+require an authorized certificate and reject plaintext. The new health path
+changes neither disk formats nor the Raft consensus protocol beyond adding
+read-only RPC types. No HTTP server, Kubernetes probe endpoint, or production
+health controller is added in this phase.
+
+### Phase 29 exact Git staging list (12 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_health.h include/raft_wire.h \
+  src/raft_health.c src/raft_tcp.c src/raft_wire.c src/main.c \
+  tests/test_raft_health.c tests/test_health_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "feat: expose raft liveness and conservative write readiness checks"
+```
+
+**Next:** Phase 30 — Fault injection, partition simulations and recovery validation.

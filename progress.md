@@ -974,3 +974,40 @@ git commit -m "feat: expose bounded raft metrics and operational diagnostics"
 ```
 
 **Next:** Phase 29 — operational health and readiness.
+
+## Phase 29 / 35 — Operational Health and Write Readiness
+
+- [x] Add read-only, fixed-size `RHLT` v1 health RPC alongside Phase 28 metrics.
+- [x] Distinguish successful node liveness probes from operational write readiness.
+- [x] Require a local leader role and recent successful same-term peer acknowledgement before readiness.
+- [x] Expire the quorum-contact observation after 3000 monotonic milliseconds.
+- [x] Fail closed on storage failure, disabled elections, expired contact, or term transition.
+- [x] Add bounded `--health`, `--health-tls`, `--ready`, and `--ready-tls` probes.
+- [x] Fail cluster readiness on contradictory leader reports or a newer observed term.
+- [x] Preserve stronger log/node regression tests, prior CLI behavior, and all disk formats.
+- [x] Add a defensive protocol test and live single-node, majority, partition and TLS checks.
+- [ ] Run on your Fedora host and commit at the actual completion date.
+
+### Phase 29 build and targeted tests
+
+```sh
+sudo dnf install gcc clang make openssl-devel openssl python3
+make clean && make && make test
+./build/test_raft_health
+python3 tests/test_health_integration.py ./build/raft-engine
+./build/raft-engine --health config/node1.conf 1
+./build/raft-engine --ready config/node1.conf
+```
+
+### Phase 29 exact Git staging list (12 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_health.h include/raft_wire.h \
+  src/raft_health.c src/raft_tcp.c src/raft_wire.c src/main.c \
+  tests/test_raft_health.c tests/test_health_integration.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "feat: expose raft liveness and conservative write readiness checks"
+```
+
+**Next:** Phase 30 — controlled fault injection and partition/recovery validation.

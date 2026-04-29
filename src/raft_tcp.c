@@ -17,6 +17,7 @@
 #include "raft_dedup.h"
 #include "raft_auth.h"
 #include "raft_metrics.h"
+#include "raft_health.h"
 #include <stdlib.h>
 
 #include <arpa/inet.h>
@@ -226,6 +227,9 @@ struct tcp_server {
     tcp_worker_t workers[RAFT_TCP_MAX_WORKERS];
     raft_node_id_t node_id;
     raft_metrics_t metrics; /* Atomic event counters; gauges from node mutex. */
+    uint64_t health_last_ack_ms; /* guarded by mutex; successful same-term RPC */
+    raft_term_t health_last_ack_term;
+    bool health_ack_valid;
     raft_node_t vote_node; /* Protected by server->mutex. */
     raft_kv_store_t kv;   /* Same mutex, only committed entries are applied. */
     raft_cluster_config_t config; /* Fixed set of allowed candidate IDs. */
@@ -356,7 +360,35 @@ static void process_client(int fd, tcp_server_t *server)
                                    sizeof(payload), &length, message, sizeof(message));
     if (status != RAFT_WIRE_OK && status != RAFT_WIRE_CLOSED)
         raft_metrics_increment(&server->metrics, RAFT_METRIC_REJECTED_FRAMES);
-    if (status == RAFT_WIRE_OK && type == RAFT_WIRE_METRICS_REQUEST && length == 0 &&
+    if (status == RAFT_WIRE_OK && type == RAFT_WIRE_HEALTH_REQUEST && length == 0 &&
+        (!raft_tls_enabled() || raft_tls_remote_client() || raft_tls_remote_node())) {
+        uint64_t now_ms = 0;
+        if (raft_clock_monotonic_ms(&now_ms) != RAFT_OK) return;
+        raft_health_input_t input;
+        uint8_t result[RAFT_HEALTH_WIRE_BYTES];
+        (void)pthread_mutex_lock(&server->mutex);
+        raft_node_t *node = &server->vote_node;
+        input = (raft_health_input_t){
+            .node_id = node->id,
+            .role = (uint8_t)node->role,
+            .term = node->current_term,
+            .commit_index = node->commit_index,
+            .last_applied = node->last_applied,
+            .started_ms = server->metrics.started_ms,
+            .now_ms = now_ms,
+            .last_ack_ms = server->health_last_ack_ms,
+            .last_ack_term = server->health_last_ack_term,
+            .ack_valid = server->health_ack_valid,
+            .election_enabled = server->election_thread_started,
+            .storage_healthy = !server->storage_failed && !stop_requested
+        };
+        (void)pthread_mutex_unlock(&server->mutex);
+        raft_health_sample_t sample;
+        if (raft_health_evaluate(&input, &sample) == 0 &&
+            raft_health_encode(&sample, result, sizeof(result)) == 0)
+            (void)raft_wire_send(fd, RAFT_WIRE_HEALTH_RESPONSE, result,
+                                 sizeof(result), message, sizeof(message));
+    } else if (status == RAFT_WIRE_OK && type == RAFT_WIRE_METRICS_REQUEST && length == 0 &&
         (!raft_tls_enabled() || raft_tls_remote_client() || raft_tls_remote_node())) {
         raft_metrics_sample_t sample;
         uint8_t result[RAFT_METRICS_WIRE_BYTES];
@@ -1174,6 +1206,13 @@ static void *election_worker_main(void *argument)
                 (void)raft_append_handle_response(&server->vote_node, &reply, now);
                 bool still_leader = server->vote_node.role == RAFT_LEADER &&
                     server->vote_node.current_term == heartbeat_term;
+                if (still_leader && reply.success && reply.term == heartbeat_term) {
+                    /* One other voter + self is a quorum for this fixed
+                     * three-member cluster. This is recent contact, NOT a lease. */
+                    server->health_last_ack_ms = now;
+                    server->health_last_ack_term = heartbeat_term;
+                    server->health_ack_valid = true;
+                }
                 if (still_leader) {
                     if (sending_snapshot) {
                         if (selected_index==server->snapshot_index &&
@@ -1270,6 +1309,7 @@ static void *election_worker_main(void *argument)
                 if (previous == RAFT_CANDIDATE &&
                     server->vote_node.role == RAFT_LEADER) {
                     raft_metrics_increment(&server->metrics, RAFT_METRIC_LEADER_TRANSITIONS);
+                    server->health_ack_valid = false;
                     printf("Leader elected: node=%u term=%llu votes=%u/3\n",
                            server->node_id,
                            (unsigned long long)server->vote_node.current_term,
