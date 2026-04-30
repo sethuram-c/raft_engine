@@ -7,7 +7,7 @@ LDLIBS ?= -lssl -lcrypto
 PYTHON ?= python3
 
 APP = build/raft-engine
-LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c src/raft_client_write.c src/raft_dedup.c src/raft_client_auto.c src/raft_auth.c src/raft_tls.c src/raft_metrics.c src/raft_health.c
+LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c src/raft_client_write.c src/raft_dedup.c src/raft_client_auto.c src/raft_auth.c src/raft_tls.c src/raft_metrics.c src/raft_health.c src/raft_fault.c
 HEADERS = $(wildcard include/*.h)
 TEST_LOG = build/test_raft_log
 TEST_NODE = build/test_raft_node
@@ -34,6 +34,7 @@ TEST_AUTO = build/test_raft_client_auto
 TEST_AUTH = build/test_raft_auth
 TEST_METRICS = build/test_raft_metrics
 TEST_HEALTH = build/test_raft_health
+TEST_FAULT = build/test_raft_fault
 
 .PHONY: all run demo check-config test test-smoke test-unit test-network clean
 all: $(APP)
@@ -135,7 +136,10 @@ check-config: $(APP)
 test-smoke: $(APP)
 	sh tests/test_smoke.sh ./$(APP)
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL) $(TEST_SNAPWAL) $(TEST_CLIENT_WRITE) $(TEST_DEDUP) $(TEST_AUTO) $(TEST_AUTH) $(TEST_METRICS) $(TEST_HEALTH)
+$(TEST_FAULT): tests/test_raft_fault.c src/raft_fault.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_fault.c src/raft_fault.c $(LDFLAGS) $(LDLIBS) -o $@
+
+test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL) $(TEST_SNAPWAL) $(TEST_CLIENT_WRITE) $(TEST_DEDUP) $(TEST_AUTO) $(TEST_AUTH) $(TEST_METRICS) $(TEST_HEALTH) $(TEST_FAULT)
 	./$(TEST_LOG)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
@@ -161,6 +165,7 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_AUTH)
 	./$(TEST_METRICS)
 	./$(TEST_HEALTH)
+	./$(TEST_FAULT)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -187,6 +192,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_tls_lifecycle.py ./$(APP)
 	$(PYTHON) tests/test_metrics_integration.py ./$(APP)
 	$(PYTHON) tests/test_health_integration.py ./$(APP)
+	$(PYTHON) tests/test_fault_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

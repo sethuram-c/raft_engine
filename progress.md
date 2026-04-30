@@ -1011,3 +1011,40 @@ git commit -m "feat: expose raft liveness and conservative write readiness check
 ```
 
 **Next:** Phase 30 — controlled fault injection and partition/recovery validation.
+
+
+## Phase 30 / 35 — Controlled Fault Injection & Network Partition Recovery
+
+- [x] Add an isolated in-memory `--elect-fault CONFIG PRIVATE_RULE_DIR` mode.
+- [x] Drop outbound internal RequestVote, AppendEntries and InstallSnapshot RPCs to blocked peers.
+- [x] Atomically reload owner-only per-node rule files on each outgoing attempt.
+- [x] Fail closed for malformed, oversize, unsafe, or unreadable policy files.
+- [x] Reject symlink policy files and non-private policy directories.
+- [x] Verify an isolated leader remains reachable but cannot majority-commit a new write.
+- [x] Verify the connected two-voter partition elects a higher-term leader and commits.
+- [x] Verify healing steps down the former leader and repairs conflicting uncommitted entries.
+- [x] Verify a restarted follower catches up with the committed history.
+- [x] Preserve legacy modes, storage formats, peer wire messages and stronger regression tests.
+- [x] Run the full earlier + new `make test` suite and targeted sanitizer checks.
+- [ ] Run tests on the learner's Fedora workstation and commit at actual completion time.
+
+### Phase 30 commands
+
+```sh
+make clean && make && make test
+./build/test_raft_fault
+python3 tests/test_fault_integration.py ./build/raft-engine
+```
+
+### Git staging (all 11 changed/new files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_fault.h include/raft_tcp.h \
+  src/raft_fault.c src/raft_tcp.c src/main.c \
+  tests/test_raft_fault.c tests/test_fault_integration.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "test: add controlled raft partitions and recovery invariants"
+```
+
+**Next:** Phase 31 — repeatable stress workloads and chaos validation.

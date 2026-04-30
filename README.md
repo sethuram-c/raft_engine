@@ -2,7 +2,29 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 26 / 35 — Mutual TLS Transport & Raft Peer Identity Verification.**
+**Current milestone: Phase 30 / 35 — Controlled Fault Injection & Recovery Validation.**
+
+Phase 30 introduces a ROOTLESS **test-only** `--elect-fault CONFIG PRIVATE_RULE_DIR`
+mode. Write per-node `node-ID.block` files to drop outbound internal Raft
+RequestVote, AppendEntries, and InstallSnapshot traffic to the listed peer IDs.
+Replace the policy files atomically to model directed partitions and heal them.
+The new integration test proves majority-side re-election and commitment,
+no-quorum write timeout, conflict rollback, state convergence, and restarted
+follower recovery. Neither storage nor wire formats are changed. Older server
+modes ignore these policy files and preserve their existing behavior.
+
+```sh
+make clean && make && make test
+./build/test_raft_fault
+python3 tests/test_fault_integration.py ./build/raft-engine
+```
+
+See the Phase 30 lab near the bottom of the README. **Do not expose this
+fault-enabled mode outside an isolated development lab.**
+
+---
+
+**Earlier milestone: Phase 26 / 35 — Mutual TLS Transport & Raft Peer Identity Verification.**
 
 Phase 26 adds **mutual TLS 1.3** for peer Raft RPCs and HMAC-authenticated
 client writes. Each Raft node must present the exact certificate DNS SAN
@@ -1455,3 +1477,101 @@ git commit -m "feat: expose raft liveness and conservative write readiness check
 ```
 
 **Next:** Phase 30 — Fault injection, partition simulations and recovery validation.
+
+
+## Phase 30 / 35 — Reproducible Rootless Raft Network Partitions
+
+### Why fault injection is opt-in
+
+The network partition lab tests **outbound Raft peer traffic only**, without
+requiring root privileges, `iptables`, `tc`, or invasive changes to the Fedora
+host network. Existing `--elect`, `--elect-snapshot-wal`, TLS modes, and their
+compatibility tests are unaffected. The three-node lab uses **memory-only**
+`--elect-fault`. It does not claim persistent recovery across machine crashes.
+
+### Launch nodes in three terminals
+
+First build and create a PRIVATE fault directory:
+
+```sh
+make clean && make
+umask 077
+mkdir -p /tmp/raft-phase30-faults
+chmod 700 /tmp/raft-phase30-faults
+./build/raft-engine --elect-fault config/node1.conf /tmp/raft-phase30-faults
+# Separate terminals (use the same directory):
+./build/raft-engine --elect-fault config/node2.conf /tmp/raft-phase30-faults
+./build/raft-engine --elect-fault config/node3.conf /tmp/raft-phase30-faults
+```
+
+Find the currently elected leader with `--health`/`--status` and verify it can
+commit a client write. If node 2 is the leader, isolate node 2 in **both
+directions**. Write the policy with a same-directory temporary file and rename
+so the election thread never reads a partial update:
+
+```sh
+printf '1\n3\n' > /tmp/raft-phase30-faults/.node-2.pending
+mv /tmp/raft-phase30-faults/.node-2.pending /tmp/raft-phase30-faults/node-2.block
+printf '2\n' > /tmp/raft-phase30-faults/.node-1.pending
+mv /tmp/raft-phase30-faults/.node-1.pending /tmp/raft-phase30-faults/node-1.block
+printf '2\n' > /tmp/raft-phase30-faults/.node-3.pending
+mv /tmp/raft-phase30-faults/.node-3.pending /tmp/raft-phase30-faults/node-3.block
+```
+
+An isolated leader can remain TCP-live, but a new client write should TIMEOUT
+rather than become COMMITTED. The connected pair should elect a higher-term
+leader and commit independent entries. On healing, that higher term forces the
+former leader to step down and reconcile its uncommitted conflicting suffix.
+
+```sh
+for n in 1 2 3; do
+  : > /tmp/raft-phase30-faults/.node-$n.pending
+  mv /tmp/raft-phase30-faults/.node-$n.pending /tmp/raft-phase30-faults/node-$n.block
+done
+```
+
+The rule-file format is ASCII unsigned decimal peer IDs separated by spaces,
+newlines, tabs, or carriage returns; absent file means no drops. Rule files
+must be owner-owned regular files, not writable by group/others, not symlinks,
+and at most 128 bytes. Malformed, unreadable, unsafe, or oversized files **drop
+all outbound Raft RPCs** from that node (fail closed). The directory itself
+must be owned by the current user with no group/other permissions. Only
+`--elect-fault` uses these rules; they do NOT protect inbound peer RPCs, client
+connections, diagnostics, or TLS traffic. For a bidirectional partition, set
+policy rules on **both sides**.
+
+### Verification
+
+```sh
+make test
+./build/test_raft_fault
+python3 tests/test_fault_integration.py ./build/raft-engine
+```
+
+The C test covers valid rules, changing rules while running, failure policy,
+size limits, bad tokens, symlink rejection, group-writable files, and directory
+permissions. The three-process test covers healthy majority commit, partition,
+no-quorum timeout, re-election, majority-side commitment, healing and prefix
+repair, full convergence, and a restarted in-memory follower catching up.
+
+**Boundaries:** Faults are injected at the outgoing peer-RPC call site, not at
+the kernel network layer. Delay, packet corruption, disk failures, one-way
+responses, TCP handshakes, TLS behavior, and simultaneous power loss are NOT
+simulated here. This is not a formal model check or a production network
+partition facility.
+
+### Phase 30 exact Git staging list (11 changed files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  include/raft_fault.h include/raft_tcp.h \
+  src/raft_fault.c src/raft_tcp.c src/main.c \
+  tests/test_raft_fault.c tests/test_fault_integration.py
+# 11 paths above, including two tests.
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "test: add controlled raft partitions and recovery invariants"
+```
+
+**Next:** Phase 31 — Systematic stress workloads and repeatable chaos scenarios.

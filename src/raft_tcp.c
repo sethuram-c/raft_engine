@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "raft_tcp.h"
+#include "raft_fault.h"
 #include "raft_tls.h"
 #include "raft_wire.h"
 #include "raft_vote.h"
@@ -227,6 +228,7 @@ struct tcp_server {
     tcp_worker_t workers[RAFT_TCP_MAX_WORKERS];
     raft_node_id_t node_id;
     raft_metrics_t metrics; /* Atomic event counters; gauges from node mutex. */
+    raft_fault_policy_t fault; /* Lab-only outgoing Raft RPC fault policy. */
     uint64_t health_last_ack_ms; /* guarded by mutex; successful same-term RPC */
     raft_term_t health_last_ack_term;
     bool health_ack_valid;
@@ -1014,11 +1016,13 @@ static void stop_and_join_workers(tcp_server_t *server, bool interrupt)
 
 /* One outbound vote request. Socket I/O is deliberately OUTSIDE the
  * node mutex so inbound peer voting continues during elections. */
-static int request_peer_vote(const raft_peer_config_t *peer,
+static int request_peer_vote(const raft_fault_policy_t *fault,
+                             const raft_peer_config_t *peer,
                              const raft_vote_request_t *req,
                              raft_vote_response_t *response)
 {
     char error[256];
+    if (raft_fault_blocks(fault, peer->id)) return -1;
     int fd = raft_tcp_connect(peer, 250, error, sizeof(error));
     if (fd < 0) return -1;
     struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
@@ -1052,11 +1056,13 @@ static int request_peer_vote(const raft_peer_config_t *peer,
 #define RAFT_HEARTBEAT_CONNECT_MS 80
 #define RAFT_HEARTBEAT_IO_TIMEOUT_US 95000
 
-static int send_peer_replication(const raft_peer_config_t *peer,
+static int send_peer_replication(const raft_fault_policy_t *fault,
+                                 const raft_peer_config_t *peer,
                                  const uint8_t *payload, size_t length,
                                  raft_append_response_t *response)
 {
     char error[256];
+    if (raft_fault_blocks(fault, peer->id)) return -1;
     int fd = raft_tcp_connect(peer, RAFT_HEARTBEAT_CONNECT_MS, error, sizeof(error));
     if (fd < 0) return -1;
     struct timeval timeout = {.tv_sec = 0, .tv_usec = RAFT_HEARTBEAT_IO_TIMEOUT_US};
@@ -1080,11 +1086,13 @@ static int send_peer_replication(const raft_peer_config_t *peer,
 
 /* Each chunk is its own framed request on a new short-lived TCP connection.
  * The follower returns the next expected offset to recover lost acknowledgements. */
-static int send_peer_snapshot(const raft_peer_config_t *peer,
+static int send_peer_snapshot(const raft_fault_policy_t *fault,
+                              const raft_peer_config_t *peer,
                               const uint8_t *payload, size_t length,
                               raft_install_response_t *response)
 {
     char error[256];
+    if (raft_fault_blocks(fault, peer->id)) return -1;
     int fd=raft_tcp_connect(peer,RAFT_HEARTBEAT_CONNECT_MS,error,sizeof(error));
     if (fd<0) return -1;
     struct timeval timeout={.tv_sec=0,.tv_usec=RAFT_HEARTBEAT_IO_TIMEOUT_US};
@@ -1185,12 +1193,12 @@ static void *election_worker_main(void *argument)
                 raft_append_response_t reply;
                 raft_install_response_t snap_reply={0};
                 if (sending_snapshot) {
-                    if (send_peer_snapshot(peer,payload,payload_length,&snap_reply)!=0) {
+                    if (send_peer_snapshot(&server->fault,peer,payload,payload_length,&snap_reply)!=0) {
                         raft_metrics_increment(&server->metrics, RAFT_METRIC_REPLICATION_RPC_FAILURES);
                         continue;
                     }
                     reply=(raft_append_response_t){snap_reply.term,snap_reply.accepted};
-                } else if (send_peer_replication(peer,payload,payload_length,&reply)!=0) {
+                } else if (send_peer_replication(&server->fault,peer,payload,payload_length,&reply)!=0) {
                     raft_metrics_increment(&server->metrics, RAFT_METRIC_REPLICATION_RPC_FAILURES);
                     continue; /* network failure retains nextIndex for retry */
                 }
@@ -1298,7 +1306,7 @@ static void *election_worker_main(void *argument)
                 const raft_peer_config_t *peer = &server->config.peers[i];
                 if (peer->id == server->node_id) continue;
                 raft_vote_response_t reply;
-                if (request_peer_vote(peer, &request, &reply) != 0) continue;
+                if (request_peer_vote(&server->fault,peer, &request, &reply) != 0) continue;
                 if (raft_clock_monotonic_ms(&now) != RAFT_OK) break;
                 (void)pthread_mutex_lock(&server->mutex);
                 raft_role_t previous = server->vote_node.role;
@@ -1342,7 +1350,7 @@ static void *election_worker_main(void *argument)
 static int tcp_serve_mode(const raft_cluster_config_t *config,
                           unsigned int max_connections, bool elections,
                           const char *durable_directory, bool journal, bool snapshots,
-                          bool snapshot_journal, const char *auth_keyring,
+                          bool snapshot_journal, const char *auth_keyring, const char *fault_directory,
                           char *error, size_t error_capacity)
 {
     if (raft_config_validate(config, error, error_capacity) != RAFT_CONFIG_OK)
@@ -1363,9 +1371,16 @@ static int tcp_serve_mode(const raft_cluster_config_t *config,
         server.config = *config;
         server.snapshot_mode = snapshots;
         server.snapshot_journal = snapshot_journal;
+        if (fault_directory && raft_fault_init(&server.fault, config->node_id,
+                                               fault_directory) != 0) {
+            report_error(error, error_capacity,
+                         "fault directory must be a private, owner-owned directory");
+            code = EINVAL;
+        }
     }
     if (code != 0) {
-        report_error(error, error_capacity, "pthread server initialization: %s", strerror(code));
+        if (error && error_capacity && !error[0])
+            report_error(error, error_capacity, "server initialization: %s", strerror(code));
         (void)close(listener);
         return -1;
     }
@@ -1628,13 +1643,13 @@ int raft_tcp_serve(const raft_cluster_config_t *config,
                    unsigned int max_connections,
                    char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, max_connections, false, NULL, false, false, false, NULL, error, error_capacity);
+    return tcp_serve_mode(config, max_connections, false, NULL, false, false, false, NULL, NULL, error, error_capacity);
 }
 
 int raft_tcp_elect(const raft_cluster_config_t *config,
                   char *error, size_t error_capacity)
 {
-    return tcp_serve_mode(config, 0, true, NULL, false, false, false, NULL, error, error_capacity);
+    return tcp_serve_mode(config, 0, true, NULL, false, false, false, NULL, NULL, error, error_capacity);
 }
 
 int raft_tcp_elect_durable(const raft_cluster_config_t *config,
@@ -1644,7 +1659,7 @@ int raft_tcp_elect_durable(const raft_cluster_config_t *config,
         report_error(error, capacity, "durable directory is required");
         return -1;
     }
-    return tcp_serve_mode(config, 0, true, directory, false, false, false, NULL, error, capacity);
+    return tcp_serve_mode(config, 0, true, directory, false, false, false, NULL, NULL, error, capacity);
 }
 
 int raft_tcp_elect_wal(const raft_cluster_config_t *config,
@@ -1654,13 +1669,13 @@ int raft_tcp_elect_wal(const raft_cluster_config_t *config,
         report_error(error,capacity,"WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,true,false,false,NULL,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,true,false,false,NULL,NULL,error,capacity);
 }
 
 int raft_tcp_elect_snapshot(const raft_cluster_config_t *config,
                             char *error, size_t capacity)
 {
-    return tcp_serve_mode(config,0,true,NULL,false,true,false,NULL,error,capacity);
+    return tcp_serve_mode(config,0,true,NULL,false,true,false,NULL,NULL,error,capacity);
 }
 
 int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
@@ -1670,14 +1685,14 @@ int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
         report_error(error, capacity, "snapshot WAL directory is required");
         return -1;
     }
-    return tcp_serve_mode(config,0,true,directory,false,true,true,NULL,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,false,true,true,NULL,NULL,error,capacity);
 }
 
 int raft_tcp_elect_auth(const raft_cluster_config_t *config,
                        const char *keyring, char *error, size_t capacity)
 {
     if (!keyring || !*keyring) return -1;
-    return tcp_serve_mode(config,0,true,NULL,false,false,false,keyring,error,capacity);
+    return tcp_serve_mode(config,0,true,NULL,false,false,false,keyring,NULL,error,capacity);
 }
 
 int raft_tcp_elect_auth_wal(const raft_cluster_config_t *config,
@@ -1685,5 +1700,19 @@ int raft_tcp_elect_auth_wal(const raft_cluster_config_t *config,
                            char *error, size_t capacity)
 {
     if (!directory || !*directory || !keyring || !*keyring) return -1;
-    return tcp_serve_mode(config,0,true,directory,false,true,true,keyring,error,capacity);
+    return tcp_serve_mode(config,0,true,directory,false,true,true,keyring,NULL,error,capacity);
+}
+
+/* Phase 30: educational fault lab. Unmodified consensus state, wire format,
+ * storage, and existing server modes. Only outbound internal Raft peer RPCs
+ * consult dynamically replaced node-ID.block files. */
+int raft_tcp_elect_fault(const raft_cluster_config_t *config,
+                         const char *rules_directory, char *error, size_t capacity)
+{
+    if (!rules_directory || !*rules_directory) {
+        report_error(error, capacity, "private fault-rule directory required");
+        return -1;
+    }
+    return tcp_serve_mode(config, 0, true, NULL, false, false, false,
+                          NULL, rules_directory, error, capacity);
 }

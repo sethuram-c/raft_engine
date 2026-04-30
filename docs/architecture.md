@@ -1228,3 +1228,51 @@ Tests cover offline followers, an isolated but live leader, readiness expiry,
 restoration on peer return, standalone liveness, malformed wire frames, fixed
 codec invariants, plaintext rejection on TLS endpoints, and unauthorized TLS
 certificates. Counters from Phase 28 are intentionally unchanged.
+
+
+## Phase 30 — Opt-In Deterministic Outbound Peer Fault Injection
+
+The new `raft_fault_policy_t` lives inside `tcp_server_t` and is initialized
+only for `raft_tcp_elect_fault()`. The normal server modes leave it disabled.
+Immediately before dialing another Raft node, the election worker calls
+`raft_fault_blocks(&server->fault, peer->id)` at its three **outbound peer-RPC**
+call sites:
+
+1. Candidate RequestVote RPC.
+2. Leader log-bearing or heartbeat AppendEntries RPC.
+3. Leader InstallSnapshot chunk RPC.
+
+A blocked call behaves exactly like a failed remote connection. The caller
+retains all existing Raft term, retry, quorum, and commit behavior; the fault
+module neither mutates consensus state nor forges responses. No new wire
+messages, WAL records, snapshots, or Raft roles are introduced.
+
+The rule filename is `<PRIVATE_DIR>/node-<self-id>.block`. Its ASCII content
+lists decimal target peer IDs separated by whitespace. Missing files mean
+**allow all**; empty files mean **allow all**. Updating a rule uses temporary
+file + atomic rename. File parsing happens outside the Raft node mutex and
+is bounded at 128 bytes. An unreadable, malformed, symlink, oversized or
+unsafe file causes all outbound peer calls to fail closed. The directory must
+be current-user-owned and private, and files cannot be group/other writable.
+
+This lab does **not** block incoming connections. For a bidirectional partition
+both partitions must install reciprocal outbound rules. Plain diagnostic and
+client connections continue to work: tests deliberately query the old
+leader's uncommitted suffix while the peer partition is active. This is not a
+security boundary; do not give untrusted users access to the lab host.
+
+The three-process test asserts the following safety properties and recovery:
+
+- A write acknowledged as COMMITTED under a healthy quorum remains present.
+- An isolated old leader returns TIMEOUT for a new write; `commitIndex` does
+  not advance and its uncommitted value never appears in applied state.
+- The connected pair can elect a leader in a higher term and commit new state.
+- After healing, higher-term communication demotes the old leader and
+  conflicting uncommitted suffixes are repaired by AppendEntries.
+- All three replicas converge to the same committed key/value results; a
+  restarted empty follower replays the same majority-backed history.
+
+The test is bounded by wall-clock deadlines, uses isolated localhost ports,
+requires no root privileges, leaves no firewall state behind, and destroys
+its temporary directory. It is empirical testing, not a proof of all possible
+interleavings. The subsequent phase adds repeated randomized stress tests.

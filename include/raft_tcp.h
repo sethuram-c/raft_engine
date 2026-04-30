@@ -66,4 +66,10 @@ int raft_tcp_elect_auth_wal(const raft_cluster_config_t *config, const char *dir
 int raft_tcp_elect_snapshot_wal(const raft_cluster_config_t *config,
                                const char *directory, char *error, size_t capacity);
 
+/* Phase 30: test-only in-memory elections with runtime fault-rule files.
+ * Rule file node-ID.block lists destination peer IDs whose outgoing Raft
+ * Vote/Append/Snapshot messages should fail. Never use for production. */
+int raft_tcp_elect_fault(const raft_cluster_config_t *config,
+                         const char *rules_directory, char *error, size_t capacity);
+
 #endif /* RAFT_TCP_H */
