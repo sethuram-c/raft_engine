@@ -36,7 +36,7 @@ TEST_METRICS = build/test_raft_metrics
 TEST_HEALTH = build/test_raft_health
 TEST_FAULT = build/test_raft_fault
 
-.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos clean
+.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos test-bench bench clean
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
@@ -167,10 +167,18 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_HEALTH)
 	./$(TEST_FAULT)
 	$(PYTHON) tests/test_chaos_plan.py
+	$(PYTHON) tests/test_bench_metrics.py
 
 test-chaos: $(APP)
 	$(PYTHON) tests/test_chaos_plan.py
 	$(PYTHON) tests/test_chaos_integration.py ./$(APP)
+
+test-bench: $(APP)
+	$(PYTHON) tests/test_bench_metrics.py
+	$(PYTHON) tests/test_benchmark_integration.py ./$(APP)
+
+bench: $(APP)
+	$(PYTHON) tools/raft_bench.py --binary ./$(APP) --writes 24 --concurrency 4 --warmup 4 --json-out build/bench-results.json --csv-out build/bench-samples.csv
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -199,6 +207,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_health_integration.py ./$(APP)
 	$(PYTHON) tests/test_fault_integration.py ./$(APP)
 	$(PYTHON) tests/test_chaos_integration.py ./$(APP)
+	$(PYTHON) tests/test_benchmark_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

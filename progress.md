@@ -1088,3 +1088,43 @@ git commit -m "test: add seeded raft chaos workloads and replayable schedules"
 ```
 
 **Next:** Phase 32 — regression analysis, performance profiling, and bottleneck diagnostics.
+
+## Phase 32 / 35 — Performance Profiling and Bottleneck Analysis
+
+**Planned milestone:** February 1, 2027 (Phase 32 of the January 1–February 4 learning plan); use the actual Git commit date.
+
+- [x] Build isolated three-node benchmark from the Phase 31 fault mode.
+- [x] Measure majority-committed client CLI latency and wall-time throughput.
+- [x] Support bounded measured writes (4–200), concurrency (1–8) and warmup (0–20).
+- [x] Compute explicitly defined nearest-rank P50/P95/P99 and count failures.
+- [x] Capture per-node Raft replication/client metrics before/after the workload.
+- [x] Sample `/proc` RSS and process CPU time with no third-party Python packages.
+- [x] Measure majority-side leader election and first committed write after a partition.
+- [x] Verify confirmed key-value values across all nodes after healing.
+- [x] Produce machine-readable JSON summary and per-request CSV samples.
+- [x] Add deterministic unit tests and live three-node benchmark integration.
+- [x] Preserve existing C consensus, TLS, storage formats and original regression tests.
+- [ ] Run a multi-repetition performance campaign on the user's Fedora workstation.
+- [ ] Review and commit using the actual completion date.
+
+### Commands
+
+```sh
+make clean && make && make test
+make test-bench
+make bench
+python3 tools/raft_bench.py --binary ./build/raft-engine --writes 60 \
+  --concurrency 4 --warmup 6 --json-out /tmp/bench.json \
+  --csv-out /tmp/bench.csv
+```
+
+### Changed files (7)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  tools/raft_bench.py tests/test_bench_metrics.py tests/test_benchmark_integration.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "perf: add reproducible raft benchmarking and failover profiling"
+```
+
+**Next:** Phase 33 — choose and validate targeted optimizations against this baseline.

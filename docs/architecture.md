@@ -1321,3 +1321,51 @@ is discarded after each run. A reported failure prints server-log tails.
 **Not covered:** real packet delay or reordering, malicious network peers,
 TLS failures, power loss, disk faults, cross-cluster networking, dynamic
 membership or formal linearizability checking. Use only in a local lab.
+
+---
+
+## Phase 32 — Performance measurement boundary and benchmark topology
+
+The benchmark is an **external diagnostic**: `tools/raft_bench.py` starts
+three localhost `--elect-fault` server processes with ephemeral ports and
+private rule files, detects the elected leader using the existing STATUS RPC,
+and sends ordinary Phase 22 `--write` CLI requests. Each request is confirmed
+only when its subprocess exits successfully and prints `status=COMMITTED`.
+Neither the Raft protocol nor WAL/snapshot formats change in this phase.
+
+```
+Benchmark driver (Python stdlib)
+       |-- spawn three fault-enabled nodes (private /tmp directory)
+       |-- Phase 13 STATUS RPC: choose current leader
+       |-- warmup SET writes, excluded from summaries
+       |-- worker pool: measured SET CLI processes -> leader -> quorum ACK
+       |-- snapshot Phase 28 metric counters before/after workload
+       |-- sample /proc/<pid>/stat + /proc/<pid>/status periodically
+       |-- optional atomic rule-file partition around current leader
+       |       -> majority election -> one majority-committed recovery write
+       |       -> heal -> verify all confirmed values
+       +-- write JSON aggregate + CSV per-operation samples
+```
+
+**Measurement definitions:** latency begins immediately before launching a
+`--write` child process and ends after the child exits. Throughput counts
+only committed measured operations divided by the wall time from batch
+submission through completion. Warmup is excluded. The P50/P95/P99 calculation
+uses the nearest-rank method. The optional failover timer begins once the
+outbound partition rule files have been installed and ends after a successful
+majority-side write acknowledgement. Majority election time and post-election
+write time are also reported separately. Rule-file install time is separately
+recorded and not included in `partition_to_committed_write_ms`.
+
+Metric counter deltas are only those with `_total` suffix; gauges such as
+`raft_max_follower_lag` and `raft_connections_peak` remain before/after
+samples, never misleadingly summed as counters. /proc CPU time is quantized
+by kernel clock ticks and sampled RSS is not a high-water-mark guarantee.
+No perf-event or eBPF privileges are required.
+
+**Threats to interpretation:** fork/exec cost, TCP round trips, the election
+heartbeat cycle, host CPU contention, kernel scheduler, finite sample size,
+and measurement overhead. Do not claim the numbers isolate Raft's internal
+consensus runtime; write path profiling in Phase 33 may add targeted C
+instrumentation if justified. `--elect-fault` is unauthenticated and must run
+only on an isolated development loopback cluster.

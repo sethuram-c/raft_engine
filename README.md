@@ -2,7 +2,13 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 31 / 35 — Seeded Chaos Workloads & Repeatable Failure Schedules.**
+**Current milestone: Phase 32 / 35 — Performance Profiling & Bottleneck Analysis.**
+
+Phase 32 introduces `tools/raft_bench.py` for measured, majority-committed write
+latency, throughput, Linux resource sampling, Raft metrics and failover timing.
+See the Phase 32 benchmarking lab at the bottom of this README.
+
+**Previous milestone: Phase 31 / 35 — Seeded Chaos Workloads & Repeatable Failure Schedules.**
 
 Phase 31 builds a **rootless seeded stress harness** on Phase 30's test-only
 `--elect-fault` server. It starts three localhost nodes, submits multiple
@@ -1657,3 +1663,74 @@ git diff --cached --stat
 git status
 git commit -m "test: add seeded raft chaos workloads and replayable schedules"
 ```
+
+---
+
+## Phase 32 / 35 - Performance profiling and bottleneck diagnosis
+
+Phase 32 adds an isolated, **measurement-only Python benchmark**. It launches
+three temporary `--elect-fault` Raft nodes on localhost, times majority-committed
+`--write` requests, and measures an actual majority-side election plus the
+first committed write after the leader is partitioned. Each benchmark checks
+that confirmed key-value data is visible across the cluster after healing.
+No C consensus logic, wire format, WAL format, TLS configuration or legacy tests
+were replaced.
+
+```sh
+make clean && make && make test
+make test-bench
+make bench
+
+# Compare two levels of CLI-client concurrency, using similar hosts / load.
+python3 tools/raft_bench.py --binary ./build/raft-engine \
+  --writes 60 --concurrency 1 --warmup 6 --no-failover \
+  --json-out /tmp/raft32-c1.json --csv-out /tmp/raft32-c1.csv
+python3 tools/raft_bench.py --binary ./build/raft-engine \
+  --writes 60 --concurrency 4 --warmup 6 \
+  --json-out /tmp/raft32-c4.json --csv-out /tmp/raft32-c4.csv
+```
+
+**What is timed:** one entire external CLI invocation (process creation, TCP,
+replication, commit acknowledgement), **not** an internal Raft function or
+pure network latency. The measured interval starts when work is submitted to
+the client executor and ends once every client finishes. Throughput is the
+number of acknowledged **COMMITTED** requests divided by this interval.
+Warmup writes are not counted. Latency quantiles use the **nearest-rank**
+method; tiny sample sizes should not be used to claim accurate P99 latency.
+
+The benchmark records per-write samples as CSV and aggregate results as JSON,
+including Phase 28 Raft counter snapshots, sampled `/proc/PID` resident memory
+and CPU, and partition-to-new-leader/confirmed-write timing. CPU sampling has
+clock-tick granularity and may show zero under light loads; RSS values are
+**sampled**, not exact process peaks. The fault creates a test-only directed
+partition with rootless per-node rule files. Sampled observations are not
+formal proof of performance or safety, and election timing varies across runs.
+
+For repeatable comparisons: pin compiler/settings/hardware, avoid running
+other tests, run multiple repetitions, increase samples, report distributions
+and failed requests rather than only best-case latency. Do not compare
+unauthenticated in-memory mode to durable TLS mode as if their costs were
+equivalent. Results depend on kernel scheduling, TCP loopback, power/CPU
+settings and measured host load. Never treat generated values as Fedora-wide
+performance guarantees.
+
+Tests:
+
+```sh
+python3 tests/test_bench_metrics.py
+python3 tests/test_benchmark_integration.py ./build/raft-engine
+```
+
+### Phase 32 exact Git staging list (7 files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  tools/raft_bench.py tests/test_bench_metrics.py \
+  tests/test_benchmark_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "perf: add reproducible raft benchmarking and failover profiling"
+```
+
+**Next:** Phase 33 - targeted optimization and performance regressions.
