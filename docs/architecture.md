@@ -1276,3 +1276,48 @@ The test is bounded by wall-clock deadlines, uses isolated localhost ports,
 requires no root privileges, leaves no firewall state behind, and destroys
 its temporary directory. It is empirical testing, not a proof of all possible
 interleavings. The subsequent phase adds repeated randomized stress tests.
+
+
+## Phase 31 — Seeded Chaos Orchestration (Test Harness Only)
+
+`tools/raft_chaos.py` is an independent Python standard-library process
+harness. It launches three separate C server processes using Phase 30's
+`--elect-fault` mode, ephemeral localhost ports, and private temporary rule
+files. No changes are made to `raft_node_t`, the Raft protocol, TLS, WAL,
+snapshots, or deployed server modes.
+
+The orchestrator converts a 32-bit seed into an immutable, versioned JSON
+schedule: 1–8 rounds; 2–5 deterministic SET key/value pairs per round; a
+selected DEL; and a Boolean follower restart. The actual current leader is
+discovered at each phase through the existing read-only STATUS RPC, so the
+plan does not assume which node wins an election. The script sends SETs
+concurrently over existing `--write` commands (one distinct key each), waits
+for COMMITTED replies, then checks all replica-local GET diagnostics.
+
+To simulate a partition it atomically replaces per-node `.block` files,
+disconnecting the observed leader in both directions. This causes the
+isolated leader's attempted write to time out without advancing its commit
+index or changing the visible state. The connected majority elects a
+higher-term leader and commits another unique entry. Clearing all rules
+heals the partition; the runner waits for all replicas to recover a single
+leader/term and the same expected key/value/deleted state.
+
+**Checks are empirical.** Individual log records must satisfy
+`0 <= commitIndex <= lastLogIndex`, and sampled STATUS observations must not
+show two simultaneous leaders *in the same term*. These snapshots are read
+sequentially, not atomically, so they do not constitute a proof of leader
+election safety. The more important end-to-end oracle is preservation and
+convergence of all explicitly acknowledged committed writes and deletions,
+plus rejection of the minority leader's uncommitted command after reconciliation.
+
+The `--plan-out` JSON file records actions, while `--trace` JSONL records
+actual order/elapsed timing, selected leaders, replies, partition changes,
+and verification outcomes. `--replay-plan` reexecutes the same *actions* but
+not exact timing, scheduler choices, node IDs, or network interleavings.
+Inputs are strictly validated and bounded, with no user-supplied raw shell
+commands. Runner teardown terminates subprocesses; the temporary directory
+is discarded after each run. A reported failure prints server-log tails.
+
+**Not covered:** real packet delay or reordering, malicious network peers,
+TLS failures, power loss, disk faults, cross-cluster networking, dynamic
+membership or formal linearizability checking. Use only in a local lab.

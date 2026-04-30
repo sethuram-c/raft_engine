@@ -1048,3 +1048,43 @@ git commit -m "test: add controlled raft partitions and recovery invariants"
 ```
 
 **Next:** Phase 31 — repeatable stress workloads and chaos validation.
+
+
+## Phase 31 / 35 — Seeded Chaos Workloads and Replayable Test Plans
+
+- [x] Implement a separate rootless, Python standard-library chaos runner.
+- [x] Use reproducible versioned action plans generated from a bounded seed.
+- [x] Validate every replayed action plan before executing it.
+- [x] Submit concurrent `SET` operations and a committed `DEL` per round.
+- [x] Isolate the *observed* leader and verify a minority cannot commit.
+- [x] Elect a higher-term majority leader, commit and heal partitions.
+- [x] Verify every confirmed value/deletion after healing and follower catch-up.
+- [x] Optionally restart a follower according to the saved schedule.
+- [x] Save timestamped JSONL event traces and portable plan JSON.
+- [x] Integrate plan unit checks and a live three-node chaos test into `make test`.
+- [x] Preserve Phase 1–30 sources, wire/storage formats and stronger regression tests.
+- [ ] Run repeatable multi-seed stress on your Fedora workstation and review traces.
+- [ ] Commit with the actual completion timestamp.
+
+### Phase 31 commands
+
+```sh
+make clean && make && make test
+make test-chaos
+python3 tools/raft_chaos.py --binary ./build/raft-engine \
+  --seed 31 --rounds 2 --plan-out /tmp/phase31-plan.json \
+  --trace /tmp/phase31-events.jsonl
+python3 tools/raft_chaos.py --binary ./build/raft-engine \
+  --replay-plan /tmp/phase31-plan.json
+```
+
+### Exact Phase 31 changed/new files (7)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  tools/raft_chaos.py tests/test_chaos_plan.py tests/test_chaos_integration.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "test: add seeded raft chaos workloads and replayable schedules"
+```
+
+**Next:** Phase 32 — regression analysis, performance profiling, and bottleneck diagnostics.

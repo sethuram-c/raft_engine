@@ -2,7 +2,36 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 30 / 35 — Controlled Fault Injection & Recovery Validation.**
+**Current milestone: Phase 31 / 35 — Seeded Chaos Workloads & Repeatable Failure Schedules.**
+
+Phase 31 builds a **rootless seeded stress harness** on Phase 30's test-only
+`--elect-fault` server. It starts three localhost nodes, submits multiple
+concurrent `SET` commands and a committed `DEL`, isolates the observed leader,
+verifies no-quorum timeout, checks majority-side reelection and commitment,
+heals the partition, then verifies committed key-value state on every node.
+Some seeded rounds restart a follower and require it to catch up. A JSON action
+plan can be saved and replayed; a JSONL event trace explains what actually
+happened. Random seeds repeat **actions**, not the OS thread schedule or exact
+Raft election timing.
+
+```sh
+make clean && make && make test
+make test-chaos
+python3 tools/raft_chaos.py --binary ./build/raft-engine \
+  --seed 31 --rounds 2 --plan-out /tmp/raft31-plan.json \
+  --trace /tmp/raft31-events.jsonl
+python3 tools/raft_chaos.py --binary ./build/raft-engine \
+  --replay-plan /tmp/raft31-plan.json --trace /tmp/raft31-replay.jsonl
+```
+
+Tests and artifacts are under `tests/` and `tools/`; no C consensus, wire,
+storage, or TLS behavior changed in Phase 31. The harness is educational and
+must be run only in an isolated local development environment. See the
+**Phase 31 chaos lab** at the end of this README.
+
+---
+
+**Previous milestone: Phase 30 / 35 — Controlled Fault Injection & Recovery Validation.**
 
 Phase 30 introduces a ROOTLESS **test-only** `--elect-fault CONFIG PRIVATE_RULE_DIR`
 mode. Write per-node `node-ID.block` files to drop outbound internal Raft
@@ -1575,3 +1604,56 @@ git commit -m "test: add controlled raft partitions and recovery invariants"
 ```
 
 **Next:** Phase 31 — Systematic stress workloads and repeatable chaos scenarios.
+
+
+## Phase 31 chaos lab — seeded schedules and correctness oracles
+
+The new `tools/raft_chaos.py` creates a validated, versioned JSON action plan
+and optionally writes an ordered JSONL observation trace. The plan is portable:
+no TCP ports, process IDs, wall-clock times or private data are embedded.
+The harness always uses temporary loopback configurations and a private fault
+rule directory; it leaves no firewall or persistent cluster state behind.
+
+```sh
+python3 tests/test_chaos_plan.py
+python3 tests/test_chaos_integration.py ./build/raft-engine
+python3 tools/raft_chaos.py --binary ./build/raft-engine --seed 41 --rounds 3 \
+  --plan-out /tmp/raft-chaos-plan.json --trace /tmp/raft-chaos-events.jsonl
+python3 tools/raft_chaos.py --binary ./build/raft-engine \
+  --replay-plan /tmp/raft-chaos-plan.json --trace /tmp/raft-chaos-replay.jsonl
+python3 tools/raft_chaos.py --seed 41 --rounds 3 --plan-only
+```
+
+A round performs (1) concurrent, independent committed SET commands, (2) a
+committed DEL of a selected key, (3) a bidirectional minority partition,
+(4) an isolated-leader write that must not be acknowledged or applied, (5) a
+higher-term election and committed majority-side write, (6) healing and
+state convergence, and (7) optionally restarting an in-memory follower.
+The harness checks `commitIndex <= lastLogIndex`, samples leader roles by
+term, and validates that every confirmed key/value or deletion survives
+partition healing and catch-up. Local GET diagnostics are not linearizable.
+
+`--seed` accepts unsigned 32-bit integers; `--rounds` accepts 1 through 8.
+Plans are schema-validated before replay. A seed reproduces workloads and
+fault-action order, **not** process scheduling, exact timings, or elected node
+IDs. JSONL traces record live observations and can differ across replays.
+The runner uses Phase 30's `--elect-fault` mode only; it never injects faults
+into production-oriented server modes.
+
+**Scope boundaries:** one three-voter cluster per run, localhost, outbound
+Raft peer RPC drops, memory-only server state, bounded timeouts. This is
+neither a Jepsen linearizability checker nor a formal proof of all Raft
+interleavings; it does not cover disk faults, kernel-level delay/reordering,
+TLS, security or real multi-machine deployments. Treat intermittent failures
+as leads for investigation and preserve the seed/plan/trace and server logs.
+
+### Phase 31 exact Git staging list (7 paths)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  tools/raft_chaos.py tests/test_chaos_plan.py tests/test_chaos_integration.py
+git diff --cached --check
+git diff --cached --stat
+git status
+git commit -m "test: add seeded raft chaos workloads and replayable schedules"
+```

@@ -36,7 +36,7 @@ TEST_METRICS = build/test_raft_metrics
 TEST_HEALTH = build/test_raft_health
 TEST_FAULT = build/test_raft_fault
 
-.PHONY: all run demo check-config test test-smoke test-unit test-network clean
+.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos clean
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
@@ -166,6 +166,11 @@ test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(
 	./$(TEST_METRICS)
 	./$(TEST_HEALTH)
 	./$(TEST_FAULT)
+	$(PYTHON) tests/test_chaos_plan.py
+
+test-chaos: $(APP)
+	$(PYTHON) tests/test_chaos_plan.py
+	$(PYTHON) tests/test_chaos_integration.py ./$(APP)
 
 test-network: $(APP)
 	$(PYTHON) tests/test_tcp_integration.py ./$(APP)
@@ -193,6 +198,7 @@ test-network: $(APP)
 	$(PYTHON) tests/test_metrics_integration.py ./$(APP)
 	$(PYTHON) tests/test_health_integration.py ./$(APP)
 	$(PYTHON) tests/test_fault_integration.py ./$(APP)
+	$(PYTHON) tests/test_chaos_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)
