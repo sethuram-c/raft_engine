@@ -1128,3 +1128,53 @@ git commit -m "perf: add reproducible raft benchmarking and failover profiling"
 ```
 
 **Next:** Phase 33 — choose and validate targeted optimizations against this baseline.
+
+
+## Phase 33 / 35 — Targeted Optimization and Performance Regression Testing
+
+**Planned milestone:** February 2, 2027, in the original 35-phase plan. Do not
+backdate Git commits; use the actual completion date.
+
+- [x] Identify repeated retained-prefix allocation/copying in follower reconcile.
+- [x] Preserve existing matching, conflict, commit and snapshot-index semantics.
+- [x] Stage copied payloads before reserving a larger descriptor buffer.
+- [x] Geometric capacity growth for append-only batches.
+- [x] Preserve prior conflict-rewrite failure-atomic fallback.
+- [x] Add 4,096-entry deterministic growth-regression test plus aliasing cases.
+- [x] Add isolated in-memory benchmark with Phase 32-compatible harness.
+- [x] Compare baseline and optimized GCC -O2 builds over seven runs.
+- [x] Run unit tests and ASan/UBSan on old/new reconciliation cases.
+- [ ] Reproduce latency numbers on the learner's Fedora machine.
+- [ ] Review Git diff, commit with the actual completion date.
+
+### Measurements (specific to the benchmark host and synthetic workload)
+
+| Revision | Median elapsed (8192 appends) | Repetitions |
+|---|---:|---:|
+| Phase 32 baseline | 81.982 ms | 7 |
+| Phase 33 optimized | 0.340 ms | 7 |
+
+The ~241x ratio is for *in-memory append-only reconciliation*, not for a
+Raft cluster's external end-to-end write latency or throughput. Compare with
+`make bench` to measure external writes including process, TCP and quorum cost.
+
+### Commands
+
+```sh
+make clean && make && make test
+./build/test_raft_reconcile_perf
+make bench-reconcile
+make test-bench
+make bench
+```
+
+### Git staging (all 7 paths)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  src/raft_log.c tests/test_raft_reconcile_perf.c tools/raft_reconcile_bench.c
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "perf: optimize follower append-only reconciliation with safe growth"
+```
+
+**Next:** Phase 34 — release-readiness and deployment audit.

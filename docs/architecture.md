@@ -1369,3 +1369,40 @@ and measurement overhead. Do not claim the numbers isolate Raft's internal
 consensus runtime; write path profiling in Phase 33 may add targeted C
 instrumentation if justified. `--elect-fault` is unauthenticated and must run
 only on an isolated development loopback cluster.
+
+
+---
+
+## Phase 33 — Targeted follower AppendEntries append optimization
+
+The Phase 32 reconciliation algorithm created a fresh descriptor array on
+*every* append to a follower, even with a matching `(prevIndex, prevTerm)` and
+no conflicting tail. Each step copied all prior descriptors plus incoming
+commands. For `n` one-entry messages this is `O(n^2)` descriptor copies.
+
+Phase 33 branches **only** when `keep == log->count` after the complete input
+batch has been validated and the committed-index safety check has passed.
+Incoming payloads are cloned into staged records (16 stack entries for an
+ordinary batch; dynamically allocated staging for larger batches). Reserve
+capacity geometrically: 4, 8, 16, 32 ... up to the architecture's maximum
+safe entry count. After reservation succeeds, `memcpy` publishes the staged
+records in one non-failing step and increments `count` and `out_last_matched`.
+
+This ordering preserves failure atomicity and avoids dangling input pointers
+if the supplied entry descriptor aliases the follower's old log array. When
+a request *conflicts* with the follower's suffix, the unchanged replacement
+path continues to allocate and own all replacement bytes before freeing any
+old entry. Empty and duplicate matching batches are still zero-allocation.
+
+A 4,096-entry deterministic correctness test bounds growth events rather than
+wall time, because performance assertions are flaky in CI. The standalone
+`tools/raft_reconcile_bench.c` measures 8,192 one-entry appends without Raft
+network/process/commit/TLS/WAL overhead and is compatible with Phase 32's
+`src/raft_log.c` for a same-harness comparison. Benchmark results in the
+Phase 33 guide are specific to the runner and compiler flags; end-to-end
+performance remains separately measurable using `tools/raft_bench.py`.
+
+No transport, on-disk, snapshot, client, authentication, or consensus protocol
+format is modified. Access still requires external synchronization by the
+Raft server node mutex. The optimization changes **only** the memory-work
+complexity of normal follower append reconciliation.

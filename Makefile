@@ -35,8 +35,10 @@ TEST_AUTH = build/test_raft_auth
 TEST_METRICS = build/test_raft_metrics
 TEST_HEALTH = build/test_raft_health
 TEST_FAULT = build/test_raft_fault
+TEST_RECONCILE_PERF = build/test_raft_reconcile_perf
+RECONCILE_BENCH = build/raft-reconcile-bench
 
-.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos test-bench bench clean
+.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos test-bench bench bench-reconcile clean
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
@@ -139,8 +141,18 @@ test-smoke: $(APP)
 $(TEST_FAULT): tests/test_raft_fault.c src/raft_fault.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_fault.c src/raft_fault.c $(LDFLAGS) $(LDLIBS) -o $@
 
-test-unit: $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL) $(TEST_SNAPWAL) $(TEST_CLIENT_WRITE) $(TEST_DEDUP) $(TEST_AUTO) $(TEST_AUTH) $(TEST_METRICS) $(TEST_HEALTH) $(TEST_FAULT)
+$(TEST_RECONCILE_PERF): tests/test_raft_reconcile_perf.c src/raft_log.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_reconcile_perf.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
+
+$(RECONCILE_BENCH): tools/raft_reconcile_bench.c src/raft_log.c $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) -O2 tools/raft_reconcile_bench.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
+
+bench-reconcile: $(RECONCILE_BENCH)
+	./$(RECONCILE_BENCH) 8192
+
+test-unit: $(TEST_RECONCILE_PERF) $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST_WIRE) $(TEST_TIMER) $(TEST_VOTE) $(TEST_ELECTION) $(TEST_APPEND) $(TEST_RECONCILE) $(TEST_REPLICATION) $(TEST_PROGRESS) $(TEST_COMMIT) $(TEST_APPLY) $(TEST_STORAGE) $(TEST_WAL) $(TEST_CHECKPOINT) $(TEST_SNAPSHOT) $(TEST_INSTALL) $(TEST_SNAPWAL) $(TEST_CLIENT_WRITE) $(TEST_DEDUP) $(TEST_AUTO) $(TEST_AUTH) $(TEST_METRICS) $(TEST_HEALTH) $(TEST_FAULT)
 	./$(TEST_LOG)
+	./$(TEST_RECONCILE_PERF)
 	./$(TEST_NODE)
 	./$(TEST_CONFIG)
 	./$(TEST_WIRE)

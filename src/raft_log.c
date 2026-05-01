@@ -23,19 +23,30 @@ void raft_log_destroy(raft_log_t *log)
     raft_log_init(log);
 }
 
-static raft_status_t reserve_one_more(raft_log_t *log)
+/* Grow geometrically for both local appends and replicated batches.
+ * Reserving a batch in one step avoids O(n^2) copies of the retained prefix. */
+static raft_status_t reserve_capacity(raft_log_t *log, size_t required)
 {
     const size_t max_entries = SIZE_MAX / sizeof(*log->entries);
-    if (log->count >= max_entries) return RAFT_ERR_NO_MEMORY;
-    if (log->count < log->capacity) return RAFT_OK;
+    if (required > max_entries) return RAFT_ERR_NO_MEMORY;
+    if (required <= log->capacity) return RAFT_OK;
     size_t next = log->capacity == 0 ? 4 : log->capacity;
-    if (next > max_entries / 2) next = max_entries;
-    else if (log->capacity != 0) next *= 2;
+    while (next < required) {
+        if (next > max_entries / 2) { next = max_entries; break; }
+        next *= 2;
+    }
     raft_log_entry_t *p = realloc(log->entries, next * sizeof(*p));
     if (p == NULL) return RAFT_ERR_NO_MEMORY;
     log->entries = p;
     log->capacity = next;
     return RAFT_OK;
+}
+
+static raft_status_t reserve_one_more(raft_log_t *log)
+{
+    const size_t max_entries = SIZE_MAX / sizeof(*log->entries);
+    if (log->count >= max_entries) return RAFT_ERR_NO_MEMORY;
+    return reserve_capacity(log, log->count + 1);
 }
 
 raft_status_t raft_log_append(raft_log_t *log, raft_term_t term,
@@ -197,8 +208,53 @@ raft_status_t raft_log_reconcile(raft_log_t *log,
     if (log->base_index + (raft_index_t)keep < committed_index)
         return RAFT_ERR_COMMITTED_CONFLICT;
 
-    /* Construct a replacement array without disturbing log's old ownership. */
+    /* Fast path: this batch only extends the local log (no conflicting tail).
+     * Copy all input payloads FIRST, before reallocating the log buffer.
+     * Once reserve_capacity succeeds, copying the staged records cannot fail,
+     * so callers never observe a partly appended batch on allocation error.
+     * The common network batch fits on the stack; larger test batches use
+     * checked heap staging. Source entries may alias the old log storage. */
     const size_t final_count = prev + entry_count;
+    if (keep == log->count) {
+        const size_t append_count = entry_count - matching;
+        raft_log_entry_t small[16];
+        raft_log_entry_t *staged = small;
+        if (append_count > sizeof(small) / sizeof(small[0])) {
+            staged = malloc(append_count * sizeof(*staged));
+            if (staged == NULL) return RAFT_ERR_NO_MEMORY;
+        }
+        size_t copied_new = 0;
+        for (size_t i = matching; i < entry_count; ++i) {
+            uint8_t *payload = NULL;
+            if (entries[i].command_len != 0) {
+                payload = malloc(entries[i].command_len);
+                if (payload == NULL) goto append_fail;
+                memcpy(payload, entries[i].command, entries[i].command_len);
+            }
+            staged[copied_new++] = (raft_log_entry_t){
+                .term = entries[i].term,
+                .command = payload,
+                .command_len = entries[i].command_len
+            };
+        }
+        raft_status_t result = reserve_capacity(log, final_count);
+        if (result != RAFT_OK) goto append_fail_status;
+        memcpy(log->entries + keep, staged, append_count * sizeof(*staged));
+        log->count = final_count;
+        *out_last_matched = prev_index + entry_count;
+        if (staged != small) free(staged);
+        return RAFT_OK;
+
+append_fail:
+        result = RAFT_ERR_NO_MEMORY;
+append_fail_status:
+        for (size_t i = 0; i < copied_new; ++i) free(staged[i].command);
+        if (staged != small) free(staged);
+        return result;
+    }
+
+    /* Conflict path: build a replacement independently, preserving the
+     * previous failure-atomic behavior and committed-prefix safety. */
     raft_log_entry_t *replacement = malloc(final_count * sizeof(*replacement));
     if (replacement == NULL) return RAFT_ERR_NO_MEMORY;
     if (keep != 0) memcpy(replacement, log->entries, keep * sizeof(*replacement));

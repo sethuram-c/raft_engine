@@ -2,7 +2,41 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 32 / 35 — Performance Profiling & Bottleneck Analysis.**
+**Current milestone: Phase 33 / 35 — Targeted Reconciliation Optimization & Regression Protection.**
+
+Phase 33 removes an identified quadratic array-copy bottleneck when a follower
+reconciles sequential, nonconflicting AppendEntries batches. The append-only
+path stages incoming commands, reserves geometrically, then publishes a batch
+atomically. Existing conflicting-suffix replacement remains unchanged.
+`make bench-reconcile` measures *only* the in-memory reconciliation loop;
+`make bench` still measures the entire three-node CLI/TCP/consensus path.
+The new unit test checks geometric capacity growth, binary command ownership,
+large batches, aliases, committed-prefix protection and compacted indices.
+No new wire messages or disk formats are introduced.
+
+```sh
+sudo dnf install gcc clang make openssl-devel python3
+make clean && make && make test
+./build/test_raft_reconcile_perf
+make bench-reconcile
+# Optional: run the Phase 32 full-cluster workload on the optimized binary:
+make test-bench
+make bench
+```
+
+**Controlled microbenchmark example (this build environment, 8,192 one-entry
+appends, GCC -O2, seven runs per version):** Phase 32 median = 81.982 ms;
+Phase 33 median = 0.340 ms (~241x for this synthetic in-memory operation).
+These are *not* end-to-end Raft write speedups. Repeat on your own Fedora host,
+with the same compiler, CPU load and benchmark harness. To compile the previous
+implementation for comparison, extract Phase 32's `src/raft_log.c` and link it
+with Phase 33's `tools/raft_reconcile_bench.c`.
+
+Exact Phase 33 staging list appears at the bottom of this README.
+
+---
+
+**Previous milestone: Phase 32 / 35 — Performance Profiling & Bottleneck Analysis.**
 
 Phase 32 introduces `tools/raft_bench.py` for measured, majority-committed write
 latency, throughput, Linux resource sampling, Raft metrics and failover timing.
@@ -1734,3 +1768,84 @@ git commit -m "perf: add reproducible raft benchmarking and failover profiling"
 ```
 
 **Next:** Phase 33 - targeted optimization and performance regressions.
+
+
+---
+
+## Phase 33 / 35 - AppendEntries append-only fast path and regression guard
+
+### Why this specific code was optimized
+
+The Phase 32 follower reconciliation implementation allocates a replacement
+`raft_log_entry_t[]` and copies the *whole retained prefix* on every entry
+addition, including normal conflict-free replication. Repeating `n` one-entry
+batches copies `1 + 2 + ... + n` descriptors: **O(n^2)** aggregate work.
+
+Phase 33 adds `reserve_capacity` with geometric growth, and an append-only
+branch in `raft_log_reconcile` when the first unmatched incoming entry begins
+at the end of the existing log (`keep == log->count`). A bounded stack staging
+array accommodates ordinary batches of <=16 entries; larger batches use
+checked heap staging. Payloads are deep-copied **before** any `realloc` of the
+log descriptor array. If payload allocation or reservation fails, previously
+published entries and the reported match index remain unchanged. If it
+succeeds, staged descriptors are copied into reserved tail slots with no
+further failing operations. Conflicting suffixes still use the original
+failure-atomic replacement array path.
+
+Neither log entry indices nor term matching nor the committed-prefix guard
+change. The operation is externally synchronized exactly as before; there is
+no new lock, wire protocol, disk or snapshot format, or CLI feature.
+
+### Reproduce the regression tests
+
+```sh
+make clean && make && make test
+./build/test_raft_reconcile
+./build/test_raft_reconcile_perf
+make bench-reconcile
+```
+
+The new test checks 4,096 sequential appends and limits capacity-growth events
+to 12, independently of timing. It also covers >16-entry heap staging, binary
+command ownership, compacted log boundaries, same-term idempotence, prevention
+of committed-prefix rewrites, and an incoming entry descriptor aliased into
+the old log's array during `realloc`.
+
+### Compare with a prior revision (same optimization flags)
+
+```sh
+# From a checkout containing Phase 33's include/ and tools/ directories:
+unzip -p /path/to/raft-engine-phase-32-source.zip \
+  raft-engine/src/raft_log.c > /tmp/raft32-log.c
+
+gcc -Iinclude -std=c11 -O2 \
+  tools/raft_reconcile_bench.c /tmp/raft32-log.c \
+  -o /tmp/raft32-reconcile-bench
+
+gcc -Iinclude -std=c11 -O2 \
+  tools/raft_reconcile_bench.c src/raft_log.c \
+  -o /tmp/raft33-reconcile-bench
+
+for i in 1 2 3 4 5 6 7; do
+  /tmp/raft32-reconcile-bench 8192
+  /tmp/raft33-reconcile-bench 8192
+done
+```
+
+The benchmark runs in a single process and does **not** model WAL fsync,
+TCP, leader election, TLS, or actual write-service throughput. Avoid asserting
+a fixed elapsed-time threshold in CI: host contention makes those flaky.
+Instead the unit test asserts geometric capacity behavior, correct bytes,
+Raft indexes, and conflict safety. `make bench` remains the end-to-end smoke.
+
+### Phase 33 exact staging list (7 new/modified files)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  src/raft_log.c tests/test_raft_reconcile_perf.c \
+  tools/raft_reconcile_bench.c
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "perf: optimize follower append-only reconciliation with safe growth"
+```
+
+**Next:** Phase 34 - release readiness, deployment and reproducibility audit.
