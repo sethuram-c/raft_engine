@@ -1406,3 +1406,29 @@ No transport, on-disk, snapshot, client, authentication, or consensus protocol
 format is modified. Access still requires external synchronization by the
 Raft server node mutex. The optimization changes **only** the memory-work
 complexity of normal follower append reconciliation.
+
+
+---
+
+## Phase 34 — Release packaging and operational boundary
+
+This phase changes **build and delivery**, not Raft consensus. The optimized
+candidate `build/raft-engine-release` is compiled from the same `src/*.c` and
+`include/*.h` with `-O2` and GCC hardening flags, independently of the debug
+`build/raft-engine` used for regression testing. The CLI and on-disk protocol
+formats are unchanged.
+
+The deterministic package generator `tools/raft_release.py` traverses only
+allowed source/config/docs/test/tool file extensions, disallows source symlinks,
+and writes one canonical `raft-engine/` ZIP tree with a fixed ZIP timestamp,
+normalized file permissions, and a SHA256SUMS record for each file. The verifier
+checks paths, entry types, uniqueness, length caps, required source files and
+all payload hashes before a release is accepted. The generated archive and its
+hash must still be distributed over an authenticated channel; its internal
+checksum manifest is not an authenticating signature.
+
+Operational diagnostics use Phase 28 metrics and Phase 29 health checks, and
+Phase 30/31 fault and chaos tests provide additional evidence. None establish
+proof of safety under all partitions, disk failures and hostile clients. Phase
+34's decision is *educational release candidate only*. See
+`docs/release-operations.md` for the signed-off vs open audit items.

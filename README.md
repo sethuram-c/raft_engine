@@ -2,7 +2,40 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
-**Current milestone: Phase 33 / 35 — Targeted Reconciliation Optimization & Regression Protection.**
+**Current milestone: Phase 34 / 35 — Release Readiness, Reproducible Packaging & Deployment Audit.**
+
+Phase 34 adds a separately compiled optimized release candidate, SHA256-manifested
+and deterministic *source-only* ZIP packaging, strict archive-path verification,
+Fedora release smoke tests, and an operational release checklist. It does not
+change Raft consensus, TCP, snapshot, WAL, or mTLS semantics, and it is **not** a
+production-readiness certification. See `docs/release-operations.md`.
+
+```sh
+sudo dnf install gcc make python3 openssl openssl-devel
+make clean && make && make test
+make release               # optimized build/raft-engine-release
+make test-release          # config/CLI smoke, tamper + traversal tests
+make package-source        # dist/raft-engine-source.zip
+make verify-source         # verify the archive's SHA256SUMS
+make check-release         # slower full acceptance gate
+```
+
+The source-package tool includes only allowlisted source, configuration, tests,
+documentation and scripts, not `build/`, `dist/`, runtime WAL/snapshots, private
+keys or certificates. `SOURCE_DATE_EPOCH` optionally pins the ZIP entry times;
+without it, a fixed ZIP-compatible epoch is used. A matching SHA256SUMS manifest
+checks integrity, **not provenance or authorship**. The `.gitignore` helps avoid
+accidental addition of credentials and runtime data. Build outputs and source
+archives are kept separate from the source ZIP provided in this phase.
+
+**Release audit decision:** suitable for local educational testing, **NOT**
+for a public or untrusted production deployment. Important outstanding work:
+linearizable reads, safe upgrades/membership change, signed releases, robust
+secret lifecycle, stronger crash/power-loss testing, and explicit licensing.
+
+---
+
+**Previous milestone: Phase 33 / 35 — Targeted Reconciliation Optimization & Regression Protection.**
 
 Phase 33 removes an identified quadratic array-copy bottleneck when a follower
 reconciles sequential, nonconflicting AppendEntries batches. The append-only

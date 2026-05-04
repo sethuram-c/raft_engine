@@ -6,6 +6,13 @@ THREAD_FLAGS = -pthread
 LDLIBS ?= -lssl -lcrypto
 PYTHON ?= python3
 
+# Phase 34: hardened, separately built release candidate (tests still use the
+# debug build, preserving assert-based test coverage).
+RELEASE_APP = build/raft-engine-release
+RELEASE_CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -g \
+                  -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+SOURCE_PACKAGE ?= dist/raft-engine-source.zip
+
 APP = build/raft-engine
 LIB_SOURCES = src/raft_log.c src/raft_node.c src/raft_config.c src/raft_tcp.c src/raft_wire.c src/raft_timer.c src/raft_vote.c src/raft_election.c src/raft_append.c src/raft_replication.c src/raft_commit.c src/raft_state_machine.c src/raft_replicate_client.c src/raft_storage.c src/raft_wal.c src/raft_snapshot.c src/raft_install.c src/raft_snapwal.c src/raft_client_write.c src/raft_dedup.c src/raft_client_auto.c src/raft_auth.c src/raft_tls.c src/raft_metrics.c src/raft_health.c src/raft_fault.c
 HEADERS = $(wildcard include/*.h)
@@ -38,11 +45,35 @@ TEST_FAULT = build/test_raft_fault
 TEST_RECONCILE_PERF = build/test_raft_reconcile_perf
 RECONCILE_BENCH = build/raft-reconcile-bench
 
-.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos test-bench bench bench-reconcile clean
+.PHONY: all run demo check-config test test-smoke test-unit test-network test-chaos test-bench bench bench-reconcile release package-source verify-source test-release check-release clean
 all: $(APP)
 
 $(APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) src/main.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+# Release candidate build keeps debug binaries available for regressions.
+$(RELEASE_APP): src/main.c $(LIB_SOURCES) $(HEADERS) Makefile | build
+	$(CC) $(CPPFLAGS) $(RELEASE_CFLAGS) $(THREAD_FLAGS) src/main.c $(LIB_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+release: $(RELEASE_APP)
+
+package-source:
+	$(PYTHON) tools/raft_release.py create --root . --output $(SOURCE_PACKAGE)
+
+verify-source:
+	$(PYTHON) tools/raft_release.py verify --archive $(SOURCE_PACKAGE)
+
+test-release: release
+	$(PYTHON) tests/test_release_smoke.py ./$(RELEASE_APP)
+	$(PYTHON) tests/test_release_package.py
+	# Exercise the optimized executable over real TCP and mutual TLS as well.
+	$(PYTHON) tests/test_client_write_integration.py ./$(RELEASE_APP)
+	$(PYTHON) tests/test_tls_integration.py ./$(RELEASE_APP)
+	$(MAKE) package-source
+	$(MAKE) verify-source
+
+# This is the slower complete acceptance gate for release candidates.
+check-release: test-release test
 
 $(TEST_LOG): tests/test_raft_log.c src/raft_log.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_log.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
@@ -180,6 +211,7 @@ test-unit: $(TEST_RECONCILE_PERF) $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST
 	./$(TEST_FAULT)
 	$(PYTHON) tests/test_chaos_plan.py
 	$(PYTHON) tests/test_bench_metrics.py
+	$(PYTHON) tests/test_release_package.py
 
 test-chaos: $(APP)
 	$(PYTHON) tests/test_chaos_plan.py

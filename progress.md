@@ -1178,3 +1178,45 @@ git commit -m "perf: optimize follower append-only reconciliation with safe grow
 ```
 
 **Next:** Phase 34 — release-readiness and deployment audit.
+
+
+## Phase 34 / 35 — Release Readiness, Reproducible Packaging and Audit
+
+**Milestone:** release candidate and operations audit; use actual Git commit date.
+
+- [x] Add separate `-O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong` candidate build.
+- [x] Implement source-only deterministic ZIP package with SHA256SUMS.
+- [x] Verify archive safety: allowed file paths, no symlinks/traversal/duplicates.
+- [x] Add unit tests for reproducibility, manifest tamper detection and bad paths.
+- [x] Add smoke checks for optimized CLI and three sample configurations.
+- [x] Add `.gitignore` for runtime data, credentials and build output.
+- [x] Document Fedora preflight, backups, certificate handling, failure response.
+- [ ] Run the acceptance gate on the learner's own Fedora machine.
+- [ ] Record independent archive SHA256 and toolchain provenance.
+- [ ] Obtain manual security review and determine redistribution license.
+- [ ] Review diff and commit with real completion date.
+
+### Quick commands
+
+```sh
+make clean && make && make test
+make release && make test-release
+make package-source && make verify-source
+make check-release
+```
+
+**Scope and decision:** No Raft peer, client, disk or snapshot format change.
+This is an educational source release candidate. Not ready for untrusted
+production networks. See `docs/release-operations.md` for remaining risks.
+
+### Git staging (all Phase 34 changes)
+
+```sh
+git add .gitignore Makefile README.md progress.md docs/architecture.md \
+  docs/release-operations.md tools/raft_release.py \
+  tests/test_release_package.py tests/test_release_smoke.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "build: add audited deterministic Raft source releases"
+```
+
+**Next:** Phase 35 — final validation, project retrospective and demonstration.
