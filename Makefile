@@ -63,6 +63,12 @@ package-source:
 verify-source:
 	$(PYTHON) tools/raft_release.py verify --archive $(SOURCE_PACKAGE)
 
+capstone-report: release
+	$(PYTHON) tools/raft_capstone.py --binary ./$(RELEASE_APP) --json-out build/capstone-report.json
+
+capstone-extended: release
+	$(PYTHON) tools/raft_capstone.py --binary ./$(RELEASE_APP) --json-out build/capstone-extended.json --extended
+
 test-release: release
 	$(PYTHON) tests/test_release_smoke.py ./$(RELEASE_APP)
 	$(PYTHON) tests/test_release_package.py
@@ -73,7 +79,7 @@ test-release: release
 	$(MAKE) verify-source
 
 # This is the slower complete acceptance gate for release candidates.
-check-release: test-release test
+check-release: test-release test capstone-report
 
 $(TEST_LOG): tests/test_raft_log.c src/raft_log.c $(HEADERS) Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) tests/test_raft_log.c src/raft_log.c $(LDFLAGS) $(LDLIBS) -o $@
@@ -212,6 +218,7 @@ test-unit: $(TEST_RECONCILE_PERF) $(TEST_LOG) $(TEST_NODE) $(TEST_CONFIG) $(TEST
 	$(PYTHON) tests/test_chaos_plan.py
 	$(PYTHON) tests/test_bench_metrics.py
 	$(PYTHON) tests/test_release_package.py
+	$(PYTHON) tests/test_capstone_report.py
 
 test-chaos: $(APP)
 	$(PYTHON) tests/test_chaos_plan.py
@@ -252,6 +259,10 @@ test-network: $(APP)
 	$(PYTHON) tests/test_fault_integration.py ./$(APP)
 	$(PYTHON) tests/test_chaos_integration.py ./$(APP)
 	$(PYTHON) tests/test_benchmark_integration.py ./$(APP)
+	$(PYTHON) tests/test_capstone_integration.py ./$(APP)
+
+test-capstone: $(APP)
+	$(PYTHON) tests/test_capstone_integration.py ./$(APP)
 
 test: test-smoke test-unit
 	sh tests/test_config_cli.sh ./$(APP)

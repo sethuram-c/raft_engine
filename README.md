@@ -2,6 +2,31 @@
 
 A learning-oriented C11 Raft/key-value engine for Fedora Linux.
 
+**Final milestone: Phase 35 / 35 — Capstone Validation & Engineering Review.**
+
+Phase 35 adds a real three-node TLS/HMAC/snapshot-WAL end-to-end acceptance
+scenario, an executable-capstone JSON evidence report, the final architecture
+and risk review, and a suggested annotated educational Git tag. It does not
+change consensus, network serialization, or persistent state formats.
+
+```sh
+sudo dnf install gcc make python3 openssl openssl-devel
+make clean && make && make test
+make test-capstone
+make release && make capstone-report
+cat build/capstone-report.json
+# Optional extra tests: make capstone-extended
+# Full release gate: make check-release
+```
+
+The report includes stage outcomes and binary hash, but deliberately excludes
+secrets, write commands and raw node logs. An automated pass is **not** a proof
+of linearizability, complete crash safety or production readiness. Read
+`docs/final-capstone.md` for the entire 35-phase project review, test matrix,
+security limitations and a final release checklist.
+
+---
+
 **Current milestone: Phase 34 / 35 — Release Readiness, Reproducible Packaging & Deployment Audit.**
 
 Phase 34 adds a separately compiled optimized release candidate, SHA256-manifested
@@ -1882,3 +1907,31 @@ git commit -m "perf: optimize follower append-only reconciliation with safe grow
 ```
 
 **Next:** Phase 34 - release readiness, deployment and reproducibility audit.
+
+
+## Phase 35: Final capstone, release evidence and project review
+
+The new `tests/test_capstone_integration.py` combines mutual TLS, HMAC
+admission, deduplicated client writes, conservative readiness/metrics,
+quorum operation during a follower failure, follower catch-up, and full-cluster
+SIGKILL/snapshot-WAL restart. `tools/raft_capstone.py` records each release
+acceptance stage and a binary digest in JSON without embedding secrets.
+
+```sh
+make test-capstone
+make release && make capstone-report
+make capstone-extended
+make check-release
+```
+
+**All 8 Phase 35 new/changed files:**
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  docs/final-capstone.md tools/raft_capstone.py \
+  tests/test_capstone_integration.py tests/test_capstone_report.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "test: complete raft capstone verification and final engineering review"
+# Optional after local acceptance and review:
+git tag -a v0.1.0-edu -m "Raft Engine educational 35-phase capstone"
+```

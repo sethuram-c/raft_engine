@@ -1,3 +1,18 @@
+## Phase 35 — Final integrated secure/durable capstone (test-only)
+
+The final integration scenario uses the existing Phase 26 TLS, Phase 25 HMAC,
+Phase 23 dedup, Phase 21 snapshot-WAL, and Phase 28–29 metrics/health surfaces.
+No new C server or wire/disk format is introduced. The capstone launches three
+private-key-backed nodes, commits and safely retries writes, kills/restarts a
+follower, then kills/restarts the whole cluster. A separate-client current-term
+barrier ensures retry tests respect Raft's older-term commit rule and each
+client's last-request-only deduplication contract. `tools/raft_capstone.py`
+records machine-readable status and binary hashes but not credentials or logs.
+See `docs/final-capstone.md` for architecture, proof limitations, Fedora labs,
+verification checklist and retrospective.
+
+---
+
 ## Phase 24 — Topology-aware client routing without new Raft messages
 
 The new `src/raft_client_auto.c` is a **client-only** layer built on the

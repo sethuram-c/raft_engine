@@ -1220,3 +1220,40 @@ git commit -m "build: add audited deterministic Raft source releases"
 ```
 
 **Next:** Phase 35 — final validation, project retrospective and demonstration.
+
+
+## Phase 35 / 35 — Final Capstone Validation & Retrospective
+
+- [x] Add integrated three-node mutual-TLS and HMAC-authenticated snapshot-WAL lab.
+- [x] Test conservative readiness, authorization, commit, dedup and conflict rejection.
+- [x] Test one follower SIGKILL with continuing two-voter majority writes.
+- [x] Test lagging follower restart/catch-up and all-node SIGKILL recovery.
+- [x] Apply a current-term barrier from a separate client before old request retry.
+- [x] Add privacy-limited JSON acceptance evidence and machine-executable tests.
+- [x] Add full 35-phase architecture, risk and engineering review.
+- [ ] Reproduce acceptance on the learner's own Fedora host.
+- [ ] Obtain human release/security review and select a redistribution license.
+- [ ] Commit with the real date and create optional educational annotated Git tag.
+
+### Commands
+
+```sh
+make clean && make && make test
+make test-capstone
+make release && make capstone-report
+make capstone-extended
+make check-release
+```
+
+### Git staging (all 8 paths)
+
+```sh
+git add Makefile README.md progress.md docs/architecture.md \
+  docs/final-capstone.md tools/raft_capstone.py \
+  tests/test_capstone_integration.py tests/test_capstone_report.py
+git diff --cached --check && git diff --cached --stat && git status
+git commit -m "test: complete raft capstone verification and final engineering review"
+```
+
+**Final status:** Phase 35 source and teaching materials complete. This is an
+educational release, not a production-certified consensus service.

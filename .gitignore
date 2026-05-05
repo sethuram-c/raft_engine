@@ -14,3 +14,11 @@
 .idea/
 *.swp
 .DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Generated release artifacts
+/dist/
+/SHA256SUMS
